@@ -54,6 +54,91 @@ func setupPipeline(t *testing.T) (*squads.SquadsPipeline, *squads.SynapseBlackbo
 	return pipeline, bb, svc
 }
 
+func TestQueryResultOnlyIncludesCurrentQueryThreads(t *testing.T) {
+	pipeline, _, _ := setupPipeline(t)
+	squad := squads.NewSquad("squad-1", "Test Squad", "desc", pipeline.Blackboard)
+	pipeline.RegisterSquad(squad)
+	pipeline.RouteQueryFn = func(ctx context.Context, content string) (any, error) {
+		return "squad-1", nil
+	}
+
+	firstResult, err := pipeline.Query(context.Background(), "thread-isolation-1", nil, "query", 0.1)
+	if err != nil {
+		t.Fatalf("first Query: %v", err)
+	}
+	if len(firstResult.SquadThreads) == 0 {
+		t.Fatal("expected first query to record squad thread mappings")
+	}
+
+	secondResult, err := pipeline.Query(context.Background(), "thread-isolation-2", nil, "query", 0.1)
+	if err != nil {
+		t.Fatalf("second Query: %v", err)
+	}
+	for firstThreadID := range firstResult.SquadThreads {
+		if _, exists := secondResult.SquadThreads[firstThreadID]; exists {
+			t.Fatalf("second result included stale thread from first query: %s", firstThreadID)
+		}
+	}
+}
+
+func TestQueryRejectsInvalidInitialSquadID(t *testing.T) {
+	tests := []struct {
+		name       string
+		initial    any
+		wantErr    string
+		wantMetric bool
+	}{
+		{
+			name:    "unregistered string squad",
+			initial: "missing-squad",
+			wantErr: "unregistered squad ID",
+		},
+		{
+			name:    "empty string squad",
+			initial: "",
+			wantErr: "empty squad ID",
+		},
+		{
+			name:    "empty squad list",
+			initial: []string{},
+			wantErr: "at least one squad ID",
+		},
+		{
+			name:    "mixed valid and unregistered list",
+			initial: []string{"squad-1", "missing-squad"},
+			wantErr: "unregistered squad ID",
+		},
+	}
+
+	for index, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pipeline, bb, _ := setupPipeline(t)
+			squad := squads.NewSquad("squad-1", "Test Squad", "desc", bb)
+			pipeline.RegisterSquad(squad)
+
+			threadID := fmt.Sprintf("invalid-initial-squad-%d", index)
+			var err error
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						t.Fatalf("Query panicked for invalid initial squad %v: %v", tt.initial, recovered)
+					}
+				}()
+				_, err = pipeline.Query(context.Background(), threadID, tt.initial, "test query", 0.1)
+			}()
+
+			if err == nil {
+				t.Fatalf("expected error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantErr)
+			}
+			if metrics := bb.GetMetrics(threadID); metrics != nil {
+				t.Fatalf("expected invalid query to fail before metrics are registered")
+			}
+		})
+	}
+}
 func TestBoundedMap(t *testing.T) {
 	m := squads.NewBoundedMap(3)
 	m.Set("a", 1)

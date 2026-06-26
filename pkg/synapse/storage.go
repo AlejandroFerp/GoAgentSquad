@@ -14,10 +14,10 @@ type BaseStorage interface {
 	// Close releases all resources.
 	Close() error
 
-	// SaveMessage persists or updates a single message.
+	// SaveMessage persists or updates a single message. Synapse treats this as a strong-consistency boundary: callers must not publish the in-memory mutation when this returns an error.
 	SaveMessage(ctx context.Context, msg SynapseMessage) error
 
-	// DeleteMessage removes a message by its ID.
+	// DeleteMessage removes a message by its ID. Synapse keeps the message visible in memory when this returns an error.
 	DeleteMessage(ctx context.Context, messageID string) error
 
 	// LoadAllActiveMessages returns every unexpired message from storage.

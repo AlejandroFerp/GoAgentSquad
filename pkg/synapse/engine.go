@@ -114,27 +114,13 @@ func (s *SynapseService) SendMessage(ctx context.Context, msg SynapseMessage) (*
 		current.Trace.CausationID = stepID
 	}
 
-	s.mu.Lock()
-	s.messageIndex[current.ID] = *current
-	s.threads[current.ThreadID] = append(s.threads[current.ThreadID], *current)
-	if current.MessageClass == ClassContextMessage {
-		cache := s.contextCache[current.ThreadID]
-		cache = append(cache, cloneMessage(*current))
-		if len(cache) > s.cacheSize {
-			cache = cache[len(cache)-s.cacheSize:]
-		}
-		s.contextCache[current.ThreadID] = cache
-	}
-	s.mu.Unlock()
-
-	// Storage errors are logged but do not roll back the in-memory blackboard.
 	if err := s.storage.SaveMessage(ctx, *current); err != nil {
-		observability.LoggerFromContext(ctx).Error("synapse storage save failed",
-			"message_id", current.ID,
-			"thread_id", current.ThreadID,
-			"error", err,
-		)
+		return nil, err
 	}
+
+	s.mu.Lock()
+	s.insertMessageLocked(*current)
+	s.mu.Unlock()
 
 	// Post-insert callbacks dispatch squads/observers asynchronously.
 	s.Events.EmitPostInsert(ctx, *current)
@@ -151,8 +137,11 @@ func (s *SynapseService) FetchContext(ctx context.Context, threadID string, limi
 
 	s.mu.RLock()
 	if cache, ok := s.contextCache[threadID]; ok && len(cache) >= limit {
-		out := make([]SynapseMessage, limit)
-		copy(out, cache[len(cache)-limit:])
+		cached := cache[len(cache)-limit:]
+		out := make([]SynapseMessage, 0, len(cached))
+		for _, msg := range cached {
+			out = append(out, cloneMessage(msg))
+		}
 		s.mu.RUnlock()
 		return out, nil
 	}
@@ -252,33 +241,89 @@ func (s *SynapseService) ConsumeTask(ctx context.Context, threadID, squadID, tas
 
 	consumed := make([]SynapseMessage, 0, len(matching))
 	for _, m := range matching {
-		ptr := s.messageIndex[m.ID]
-		ptr.ConsumedCount++
-		consumed = append(consumed, cloneMessage(ptr))
+		updated := s.messageIndex[m.ID]
+		updated.ConsumedCount++
 
-		if ptr.MaxConsumers != -1 && ptr.ConsumedCount >= ptr.MaxConsumers {
-			s.deleteMessageLocked(ctx, ptr.ID)
+		if updated.MaxConsumers != -1 && updated.ConsumedCount >= updated.MaxConsumers {
+			if err := s.deleteMessageLocked(ctx, updated.ID); err != nil {
+				return nil, err
+			}
 		} else {
-			s.messageIndex[m.ID] = ptr
-			_ = s.storage.SaveMessage(ctx, ptr)
+			if err := s.storage.SaveMessage(ctx, updated); err != nil {
+				return nil, err
+			}
+			s.replaceMessageLocked(updated)
 		}
+		consumed = append(consumed, cloneMessage(updated))
 	}
 	return consumed, nil
 }
 
 // DeleteMessage removes a message by ID from memory and storage.
-func (s *SynapseService) DeleteMessage(ctx context.Context, messageID string) bool {
+func (s *SynapseService) DeleteMessage(ctx context.Context, messageID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.messageIndex[messageID]; !ok {
-		_ = s.storage.DeleteMessage(ctx, messageID)
-		return false
+		if err := s.storage.DeleteMessage(ctx, messageID); err != nil {
+			return false, err
+		}
+		return false, nil
 	}
-	s.deleteMessageLocked(ctx, messageID)
-	return true
+	if err := s.deleteMessageLocked(ctx, messageID); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
-func (s *SynapseService) deleteMessageLocked(ctx context.Context, messageID string) {
+func (s *SynapseService) insertMessageLocked(msg SynapseMessage) {
+	s.messageIndex[msg.ID] = msg
+	s.threads[msg.ThreadID] = append(s.threads[msg.ThreadID], msg)
+	if msg.MessageClass == ClassContextMessage {
+		cache := s.contextCache[msg.ThreadID]
+		cache = append(cache, cloneMessage(msg))
+		if len(cache) > s.cacheSize {
+			cache = cache[len(cache)-s.cacheSize:]
+		}
+		s.contextCache[msg.ThreadID] = cache
+	}
+}
+
+func (s *SynapseService) replaceMessageLocked(msg SynapseMessage) {
+	s.messageIndex[msg.ID] = msg
+	if threadMsgs, ok := s.threads[msg.ThreadID]; ok {
+		for i := range threadMsgs {
+			if threadMsgs[i].ID == msg.ID {
+				threadMsgs[i] = msg
+				break
+			}
+		}
+		s.threads[msg.ThreadID] = threadMsgs
+	}
+	if msg.MessageClass == ClassContextMessage {
+		if cache, ok := s.contextCache[msg.ThreadID]; ok {
+			for i := range cache {
+				if cache[i].ID == msg.ID {
+					cache[i] = cloneMessage(msg)
+					break
+				}
+			}
+			s.contextCache[msg.ThreadID] = cache
+		}
+	}
+}
+
+func (s *SynapseService) deleteMessageLocked(ctx context.Context, messageID string) error {
+	if _, ok := s.messageIndex[messageID]; !ok {
+		return nil
+	}
+	if err := s.storage.DeleteMessage(ctx, messageID); err != nil {
+		return err
+	}
+	s.deleteMessageFromMemoryLocked(messageID)
+	return nil
+}
+
+func (s *SynapseService) deleteMessageFromMemoryLocked(messageID string) {
 	msg, ok := s.messageIndex[messageID]
 	if !ok {
 		return
@@ -298,7 +343,6 @@ func (s *SynapseService) deleteMessageLocked(ctx context.Context, messageID stri
 		}
 	}
 	if msg.MessageClass == ClassContextMessage {
-		// Keep the warm cache consistent with the authoritative indexes.
 		if cache, ok := s.contextCache[msg.ThreadID]; ok {
 			filtered := cache[:0]
 			for _, m := range cache {
@@ -313,7 +357,6 @@ func (s *SynapseService) deleteMessageLocked(ctx context.Context, messageID stri
 			}
 		}
 	}
-	_ = s.storage.DeleteMessage(ctx, messageID)
 }
 
 // ClearCache invalidates the warm context cache for a thread (or all threads).
@@ -352,7 +395,12 @@ func (s *SynapseService) CollectExpired(ctx context.Context) {
 		}
 	}
 	for _, id := range expiredIDs {
-		s.deleteMessageLocked(ctx, id)
+		if err := s.deleteMessageLocked(ctx, id); err != nil {
+			observability.LoggerFromContext(ctx).Error("synapse expired message delete failed",
+				"message_id", id,
+				"error", err,
+			)
+		}
 	}
 	s.mu.Unlock()
 }

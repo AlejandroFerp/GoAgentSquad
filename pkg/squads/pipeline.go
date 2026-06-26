@@ -134,6 +134,7 @@ type SquadsPipeline struct {
 	activeQueries      int32
 	threadToSquadMap   map[string]string
 	completionEvents   map[string]*sync.WaitGroup
+	completedQueries   map[string]struct{}
 	completionCallback func(threadID string, squadID string)
 	exceptions         map[string]error
 	iterationCounter   map[string]int
@@ -159,6 +160,7 @@ func NewSquadsPipeline(bb BlackboardBus, finalSynth FinalSynthesizer, maxIterati
 		executions:       NewBoundedMap(100),
 		threadToSquadMap: make(map[string]string),
 		completionEvents: make(map[string]*sync.WaitGroup),
+		completedQueries: make(map[string]struct{}),
 		exceptions:       make(map[string]error),
 		iterationCounter: make(map[string]int),
 		MaxIterations:    maxIterations,
@@ -334,9 +336,8 @@ func (p *SquadsPipeline) onSquadExecutionComplete(ctx context.Context, threadID 
 			"max_iterations", p.MaxIterations,
 		)
 		p.exceptions[rootThread] = fmt.Errorf("execution aborted: exceeded maximum iteration limit of %d steps", p.MaxIterations)
-		if wg, ok := p.completionEvents[rootThread]; ok {
-			wg.Done()
-		}
+		squadID := p.threadToSquadMap[rootThread]
+		p.signalCompletionLocked(rootThread, squadID)
 		p.mu.Unlock()
 		return
 	}
@@ -407,6 +408,10 @@ func (p *SquadsPipeline) signalCompletion(rootThread, squadID string) {
 }
 
 func (p *SquadsPipeline) signalCompletionLocked(rootThread, squadID string) {
+	if _, completed := p.completedQueries[rootThread]; completed {
+		return
+	}
+	p.completedQueries[rootThread] = struct{}{}
 	if p.completionCallback != nil {
 		p.completionCallback(rootThread, squadID)
 	}
@@ -424,21 +429,38 @@ func (p *SquadsPipeline) RouteQuery(ctx context.Context, content string) (any, e
 	if err != nil {
 		return nil, err
 	}
-	var squadIDs []string
-	switch v := result.(type) {
-	case string:
-		squadIDs = []string{v}
-	case []string:
-		squadIDs = v
-	default:
-		return nil, fmt.Errorf("route_query_fn returned unsupported type %T", result)
-	}
-	for _, sID := range squadIDs {
-		if _, ok := p.Squads[sID]; !ok {
-			return nil, fmt.Errorf("route_query_fn returned unregistered squad ID '%s'", sID)
-		}
+	if _, err := p.normalizeInitialSquadIDs(result, "route_query_fn returned"); err != nil {
+		return nil, err
 	}
 	return result, nil
+}
+
+func (p *SquadsPipeline) normalizeInitialSquadIDs(initialSquadID any, source string) ([]string, error) {
+	var squadIDs []string
+	switch value := initialSquadID.(type) {
+	case string:
+		squadIDs = []string{value}
+	case []string:
+		squadIDs = append([]string(nil), value...)
+	default:
+		if source == "route_query_fn returned" {
+			return nil, fmt.Errorf("route_query_fn returned unsupported type %T", initialSquadID)
+		}
+		return nil, fmt.Errorf("invalid initial_squad_id type %T", initialSquadID)
+	}
+
+	if len(squadIDs) == 0 {
+		return nil, fmt.Errorf("%s must include at least one squad ID", source)
+	}
+	for _, squadID := range squadIDs {
+		if strings.TrimSpace(squadID) == "" {
+			return nil, fmt.Errorf("%s contains empty squad ID", source)
+		}
+		if _, exists := p.Squads[squadID]; !exists {
+			return nil, fmt.Errorf("%s unregistered squad ID '%s'", source, squadID)
+		}
+	}
+	return squadIDs, nil
 }
 
 // QueryResult holds the output of a pipeline query.
@@ -502,6 +524,21 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 		initialSquadID = resolved
 	}
 
+	squadIDs, err := p.normalizeInitialSquadIDs(initialSquadID, "initial_squad_id")
+	if err != nil {
+		rootSpan.RecordError(err)
+		errTime := time.Now()
+		_, _ = recordObservedStep(ctx, p.Blackboard, observability.AgentStep{
+			Kind:       observability.StepError,
+			ThreadID:   threadID,
+			Summary:    observedSummary(err.Error()),
+			Error:      err.Error(),
+			StartedAt:  errTime,
+			FinishedAt: errTime,
+		})
+		return nil, err
+	}
+
 	metrics := NewExecutionMetrics(threadID)
 	p.Blackboard.SetMetrics(threadID, metrics)
 	p.executions.Set(threadID, metrics)
@@ -539,6 +576,7 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 		}
 		p.mu.Lock()
 		delete(p.completionEvents, threadID)
+		delete(p.completedQueries, threadID)
 		p.activeQueries--
 		if p.activeQueries == 0 {
 			for _, obs := range p.Observers {
@@ -564,15 +602,6 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 	}
 	p.mu.Unlock()
 
-	var squadIDs []string
-	switch v := initialSquadID.(type) {
-	case string:
-		squadIDs = []string{v}
-	case []string:
-		squadIDs = v
-	default:
-		return nil, fmt.Errorf("invalid initial_squad_id type %T", initialSquadID)
-	}
 	routeTime := time.Now()
 	ctx, _ = recordObservedStep(ctx, p.Blackboard, observability.AgentStep{
 		Kind:       observability.StepRouted,
@@ -588,6 +617,7 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 		_ = synth.LastSynthesizedContent()
 	}
 
+	queryThreadIDs := map[string]struct{}{threadID: {}}
 	for _, sID := range squadIDs {
 		squadThreadID := "thread-squad-" + sID + "-" + uuid.NewString()
 		p.Blackboard.ParentThreads().Set(squadThreadID, threadID)
@@ -638,9 +668,8 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 			FinishedAt: timeoutTime,
 		})
 		p.mu.Lock()
-		if wg, ok := p.completionEvents[threadID]; ok {
-			wg.Done()
-		}
+		squadID := p.threadToSquadMap[threadID]
+		p.signalCompletionLocked(threadID, squadID)
 		p.mu.Unlock()
 		return nil, fmt.Errorf("execution timed out waiting for squads pipeline to complete")
 	}
@@ -687,9 +716,11 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 	timeline := observedRuntime(p.Blackboard).Ledger.Timeline(threadID)
 
 	p.mu.Lock()
-	squadThreads := make(map[string]string, len(p.threadToSquadMap))
-	for k, v := range p.threadToSquadMap {
-		squadThreads[k] = v
+	squadThreads := make(map[string]string, len(queryThreadIDs))
+	for queryThreadID := range queryThreadIDs {
+		if squadID, ok := p.threadToSquadMap[queryThreadID]; ok {
+			squadThreads[queryThreadID] = squadID
+		}
 	}
 	p.mu.Unlock()
 

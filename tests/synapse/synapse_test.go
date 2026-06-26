@@ -175,6 +175,35 @@ func TestGarbageCollector(t *testing.T) {
 	}
 }
 
+func TestFetchContextCacheReturnsClonedMessages(t *testing.T) {
+	svc := synapse.NewSynapseService(2, nil)
+	ctx := context.Background()
+	if err := svc.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer svc.Close()
+
+	for _, content := range []string{"first", "second"} {
+		msg := synapse.NewContextMessage("thread-cache-clone", "agent-1", synapse.RoleUser, content, "", nil, 3600)
+		if _, err := svc.SendMessage(ctx, msg); err != nil {
+			t.Fatalf("SendMessage: %v", err)
+		}
+	}
+
+	got, err := svc.FetchContext(ctx, "thread-cache-clone", 2)
+	if err != nil {
+		t.Fatalf("FetchContext: %v", err)
+	}
+	got[0].Payload["content"] = "mutated"
+
+	got, err = svc.FetchContext(ctx, "thread-cache-clone", 2)
+	if err != nil {
+		t.Fatalf("FetchContext after mutation: %v", err)
+	}
+	if got[0].Content() != "first" {
+		t.Fatalf("cached message was externally mutated, got %q", got[0].Content())
+	}
+}
 func TestTaskMessageHelpers(t *testing.T) {
 	msg := synapse.NewTaskMessage("t1", "a1", "study", "reply-1", map[string]any{"q": "hello"}, "squad-1", 3600, 2)
 	if msg.TaskType() != "study" {
