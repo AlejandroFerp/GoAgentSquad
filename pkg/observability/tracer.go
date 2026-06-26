@@ -50,7 +50,7 @@ type noopSpan struct {
 }
 
 func (s *noopSpan) SetAttributes(_ ...Attr) {}
-func (s *noopSpan) RecordError(_ error)      {}
-func (s *noopSpan) SpanID() string           { return s.spanID }
-func (s *noopSpan) TraceID() string          { return s.traceID }
-func (s *noopSpan) End()                     {}
+func (s *noopSpan) RecordError(_ error)     {}
+func (s *noopSpan) SpanID() string          { return s.spanID }
+func (s *noopSpan) TraceID() string         { return s.traceID }
+func (s *noopSpan) End()                    {}
