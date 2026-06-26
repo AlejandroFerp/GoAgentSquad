@@ -206,6 +206,7 @@ func normalizeOTelRuntimeConfig(cfg OTelRuntimeConfig) (OTelRuntimeConfig, error
 	return cfg, nil
 }
 
+// newOTLPTraceExporter builds an OTLP gRPC span exporter from normalized config.
 func newOTLPTraceExporter(ctx context.Context, cfg OTelRuntimeConfig) (sdktrace.SpanExporter, error) {
 	options := make([]otlptracegrpc.Option, 0, 3)
 	if cfg.Endpoint != "" {
@@ -220,6 +221,7 @@ func newOTLPTraceExporter(ctx context.Context, cfg OTelRuntimeConfig) (sdktrace.
 	return otlptracegrpc.New(ctx, options...)
 }
 
+// newOTelResource maps service identity into OpenTelemetry resource attributes.
 func newOTelResource(cfg OTelRuntimeConfig) *sdkresource.Resource {
 	attrs := []attribute.KeyValue{attribute.String("service.name", cfg.ServiceName)}
 	if cfg.ServiceVersion != "" {

@@ -10,6 +10,9 @@ import (
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
 
+// This file centralizes observability helpers (span start, step record, logger
+// binding, and trace-context reconstruction from persisted messages).
+
 func observedRuntime(bb BlackboardBus) *ObservabilityRuntime {
 	if bb == nil {
 		return NewObservabilityRuntime()
@@ -21,10 +24,12 @@ func observedRuntime(bb BlackboardBus) *ObservabilityRuntime {
 	return runtime.ensureDefaults()
 }
 
+// startObservedSpan creates a span using the runtime tracer configured in the blackboard.
 func startObservedSpan(ctx context.Context, bb BlackboardBus, name string, attrs ...observability.Attr) (context.Context, observability.Span) {
 	return observedRuntime(bb).Tracer.StartSpan(ctx, name, attrs...)
 }
 
+// observedLogger binds correlation attributes from ctx to the runtime logger.
 func observedLogger(ctx context.Context, bb BlackboardBus) *slog.Logger {
 	runtime := observedRuntime(bb)
 	if runtime.Logger == nil {
@@ -33,6 +38,7 @@ func observedLogger(ctx context.Context, bb BlackboardBus) *slog.Logger {
 	return observability.BindLogger(runtime.Logger, ctx)
 }
 
+// contextWithMessageTrace rebuilds trace linkage when async callbacks receive persisted messages.
 func contextWithMessageTrace(ctx context.Context, msg synapse.SynapseMessage) context.Context {
 	ctx = observability.WithTraceMetadata(ctx, observability.TraceContext{
 		TraceID:       msg.Trace.TraceID,
@@ -46,6 +52,7 @@ func contextWithMessageTrace(ctx context.Context, msg synapse.SynapseMessage) co
 	return ctx
 }
 
+// recordObservedStep enriches and persists one business-level step in the ledger.
 func recordObservedStep(ctx context.Context, bb BlackboardBus, step observability.AgentStep) (context.Context, observability.AgentStep) {
 	trace, ok := observability.TraceFromContext(ctx)
 	if ok {
@@ -74,6 +81,7 @@ func recordObservedStep(ctx context.Context, bb BlackboardBus, step observabilit
 	return observability.WithStepID(ctx, step.StepID), step
 }
 
+// observedSummary trims long text payloads for compact timeline entries.
 func observedSummary(text string) string {
 	text = strings.TrimSpace(text)
 	if len(text) <= 120 {

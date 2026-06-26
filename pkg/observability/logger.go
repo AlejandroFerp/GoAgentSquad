@@ -7,6 +7,7 @@ import (
 	"os"
 )
 
+// ContextHandler injects trace/step attributes from context into each slog record.
 type ContextHandler struct {
 	next slog.Handler
 }
@@ -37,6 +38,7 @@ func (h *ContextHandler) WithGroup(name string) slog.Handler {
 	return &ContextHandler{next: h.next.WithGroup(name)}
 }
 
+// NewTextLogger creates a text logger that auto-binds trace metadata from context.
 func NewTextLogger(writer io.Writer, options *slog.HandlerOptions) *slog.Logger {
 	if writer == nil {
 		writer = os.Stderr
@@ -44,6 +46,7 @@ func NewTextLogger(writer io.Writer, options *slog.HandlerOptions) *slog.Logger 
 	return slog.New(NewContextHandler(slog.NewTextHandler(writer, options)))
 }
 
+// BindLogger returns a logger preloaded with context-derived trace fields.
 func BindLogger(logger *slog.Logger, ctx context.Context) *slog.Logger {
 	if logger == nil {
 		logger = slog.Default()
@@ -59,10 +62,12 @@ func BindLogger(logger *slog.Logger, ctx context.Context) *slog.Logger {
 	return logger.With(args...)
 }
 
+// LoggerFromContext binds trace attributes to the default logger.
 func LoggerFromContext(ctx context.Context) *slog.Logger {
 	return BindLogger(slog.Default(), ctx)
 }
 
+// contextAttrs extracts stable correlation attributes for logs.
 func contextAttrs(ctx context.Context) []slog.Attr {
 	attrs := make([]slog.Attr, 0, 5)
 	if trace, ok := TraceFromContext(ctx); ok {

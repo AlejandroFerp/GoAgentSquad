@@ -35,10 +35,12 @@ type Span interface {
 // OTelTracer adapts an OpenTelemetry tracer to the local observability contract.
 type OTelTracer struct{ tr oteltrace.Tracer }
 
+// NewOTelTracer wraps an OTel tracer with the local Tracer interface.
 func NewOTelTracer(tracer oteltrace.Tracer) OTelTracer {
 	return OTelTracer{tr: tracer}
 }
 
+// StartSpan starts a real OTel span when configured, otherwise falls back to NoopTracer.
 func (t OTelTracer) StartSpan(ctx context.Context, name string, attrs ...Attr) (context.Context, Span) {
 	if t.tr == nil {
 		return NoopTracer{}.StartSpan(ctx, name, attrs...)
@@ -197,6 +199,7 @@ func (s *recorderSpan) End() {
 	})
 }
 
+// toOTelAttributes maps local Attr values to OTel key/value attributes.
 func toOTelAttributes(attrs []Attr) []attribute.KeyValue {
 	if len(attrs) == 0 {
 		return nil

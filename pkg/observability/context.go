@@ -2,6 +2,7 @@ package observability
 
 import "context"
 
+// Unexported key types prevent collisions with other context values.
 type traceContextKey struct{}
 type stepContextKey struct{}
 

@@ -9,6 +9,9 @@ import (
 	"github.com/embention/agent-squad-go/pkg/observability"
 )
 
+// This file is the Synapse runtime engine: it owns message persistence,
+// in-memory indexes, context caching, task consumption, events, and expiry GC.
+
 // SynapseService is the in-memory blackboard engine. It coordinates event
 // emission, an LRU-style warm context cache, atomic task consumption, and a
 // background garbage collector that purges expired messages.
@@ -17,11 +20,13 @@ type SynapseService struct {
 	storage   BaseStorage
 	Events    *EventBus
 
+	// All mutable indexes below are protected by mu.
 	mu           sync.RWMutex
 	contextCache map[string][]SynapseMessage
 	threads      map[string][]SynapseMessage
 	messageIndex map[string]SynapseMessage
 
+	// gcCancel/gcDone coordinate the background expiry loop lifecycle.
 	gcCancel context.CancelFunc
 	gcDone   chan struct{}
 }
@@ -54,6 +59,7 @@ func (s *SynapseService) Connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Rebuild in-memory state deterministically from oldest to newest message.
 	sort.Slice(active, func(i, j int) bool {
 		return active[i].Timestamp < active[j].Timestamp
 	})
@@ -92,6 +98,7 @@ func (s *SynapseService) SendMessage(ctx context.Context, msg SynapseMessage) (*
 	if current == nil {
 		return nil, nil
 	}
+	// Persist trace metadata with the message so async callbacks can rebuild causality.
 	if trace, ok := observability.TraceFromContext(ctx); ok {
 		if current.Trace.TraceID == "" {
 			current.Trace.TraceID = trace.TraceID
@@ -120,6 +127,7 @@ func (s *SynapseService) SendMessage(ctx context.Context, msg SynapseMessage) (*
 	}
 	s.mu.Unlock()
 
+	// Storage errors are logged but do not roll back the in-memory blackboard.
 	if err := s.storage.SaveMessage(ctx, *current); err != nil {
 		observability.LoggerFromContext(ctx).Error("synapse storage save failed",
 			"message_id", current.ID,
@@ -128,6 +136,7 @@ func (s *SynapseService) SendMessage(ctx context.Context, msg SynapseMessage) (*
 		)
 	}
 
+	// Post-insert callbacks dispatch squads/observers asynchronously.
 	s.Events.EmitPostInsert(ctx, *current)
 	return current, nil
 }
@@ -171,7 +180,7 @@ func (s *SynapseService) FetchContext(ctx context.Context, threadID string, limi
 	}
 	result := active[start:]
 
-	// Refresh warm cache.
+	// Refresh warm cache after a cold read.
 	s.mu.Lock()
 	cached := make([]SynapseMessage, 0, s.cacheSize)
 	cs := 0
@@ -198,6 +207,8 @@ func (s *SynapseService) ConsumeTask(ctx context.Context, threadID, squadID, tas
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Keep candidate selection under the same lock as consumption so two workers
+	// cannot consume the same task concurrently.
 	var candidates []SynapseMessage
 	if threadID != "" {
 		candidates = s.threads[threadID]
@@ -287,6 +298,7 @@ func (s *SynapseService) deleteMessageLocked(ctx context.Context, messageID stri
 		}
 	}
 	if msg.MessageClass == ClassContextMessage {
+		// Keep the warm cache consistent with the authoritative indexes.
 		if cache, ok := s.contextCache[msg.ThreadID]; ok {
 			filtered := cache[:0]
 			for _, m := range cache {
@@ -345,10 +357,12 @@ func (s *SynapseService) CollectExpired(ctx context.Context) {
 	s.mu.Unlock()
 }
 
+// nowSeconds returns wall-clock seconds for message timestamps and TTL checks.
 func nowSeconds() float64 {
 	return float64(time.Now().UnixNano()) / 1e9
 }
 
+// cloneMessage copies the message payload map so callers cannot mutate cached state.
 func cloneMessage(m SynapseMessage) SynapseMessage {
 	cp := m
 	if m.Payload != nil {

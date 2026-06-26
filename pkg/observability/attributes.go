@@ -1,5 +1,6 @@
 package observability
 
+// Canonical attribute keys used across spans, logs, and dashboard projections.
 const (
 	AttrCorrelationID = "correlation_id"
 	AttrCausationID   = "causation_id"

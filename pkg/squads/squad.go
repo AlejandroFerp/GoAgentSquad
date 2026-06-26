@@ -13,6 +13,9 @@ import (
 	"github.com/google/uuid"
 )
 
+// This file contains squad-level orchestration: event subscriptions, subagent
+// fan-out execution, and final intra-squad coordination.
+
 // Squad groups a set of SubAgents that run concurrently to process a trigger
 // message on isolated subagent threads.
 type Squad struct {

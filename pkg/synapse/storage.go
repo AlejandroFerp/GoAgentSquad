@@ -2,6 +2,9 @@ package synapse
 
 import "context"
 
+// This file defines the persistence boundary for Synapse. The engine can run
+// fully in memory through NoopStorage or delegate durability to another backend.
+
 // BaseStorage is the persistence contract used by SynapseService.
 // Implementations may wrap SQLite, Postgres, or any durable store.
 type BaseStorage interface {

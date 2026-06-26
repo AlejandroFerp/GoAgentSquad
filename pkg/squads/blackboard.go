@@ -12,6 +12,9 @@ import (
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
 
+// This file defines the blackboard abstraction and its Synapse-backed adapter,
+// plus shared runtime state such as observability and parent-thread tracking.
+
 // PipelineMetrics is the thread-safe metrics contract exposed by the blackboard.
 // The concrete implementation lives in metrics.go.
 type PipelineMetrics interface {

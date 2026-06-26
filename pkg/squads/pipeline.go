@@ -12,6 +12,9 @@ import (
 	"github.com/google/uuid"
 )
 
+// This file hosts the top-level pipeline coordinator that routes queries,
+// monitors quiescence, enforces iteration/timeout limits, and returns results.
+
 // FinalSynthesizer is the interface for the final compilation step that runs
 // when the entire execution tree reaches quiescence.
 type FinalSynthesizer interface {

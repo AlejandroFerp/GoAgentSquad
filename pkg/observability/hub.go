@@ -13,6 +13,7 @@ func NewHub() *Hub {
 	return &Hub{subs: make(map[int]chan AgentStep)}
 }
 
+// Subscribe registers a buffered channel for live step delivery.
 func (h *Hub) Subscribe() (int, <-chan AgentStep) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -26,6 +27,7 @@ func (h *Hub) Subscribe() (int, <-chan AgentStep) {
 	return id, ch
 }
 
+// Unsubscribe removes and closes the subscriber channel.
 func (h *Hub) Unsubscribe(id int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -35,6 +37,7 @@ func (h *Hub) Unsubscribe(id int) {
 	}
 }
 
+// Broadcast fan-outs one step to all subscribers using non-blocking sends.
 func (h *Hub) Broadcast(step AgentStep) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

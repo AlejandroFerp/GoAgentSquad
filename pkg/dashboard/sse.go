@@ -9,26 +9,31 @@ import (
 )
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	// Keep replay-backed traces synchronized before opening the live stream.
 	s.syncTraceFile()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	// SSE headers: one long-lived HTTP response with incremental events.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
 	if s.obs == nil || s.obs.Hub == nil {
+		// SSE comment frame used as a diagnostic marker for clients.
 		fmt.Fprint(w, ": no hub configured\n\n")
 		flusher.Flush()
 		return
 	}
 
+	// Subscribe this HTTP connection to the in-memory event hub.
 	id, ch := s.obs.Hub.Subscribe()
 	defer s.obs.Hub.Unsubscribe(id)
 
+	// Initial comment frame confirms the stream is ready.
 	fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
 
@@ -40,6 +45,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			// Each observability step is emitted as a named SSE event with JSON payload.
 			payload, err := json.Marshal(step)
 			if err != nil {
 				continue

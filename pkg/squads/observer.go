@@ -9,6 +9,9 @@ import (
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
 
+// This file contains observer middleware that can inspect/augment messages
+// before they are persisted into the blackboard.
+
 // ObserverCallback is the PreInsertCallback signature for observers.
 type ObserverCallback func(ctx context.Context, msg synapse.SynapseMessage) (*synapse.SynapseMessage, error)
 

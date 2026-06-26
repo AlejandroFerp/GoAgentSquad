@@ -9,6 +9,7 @@ import (
 
 type StepKind string
 
+// Step kinds represent normalized lifecycle events emitted by the pipeline.
 const (
 	StepQueryReceived StepKind = "query_received"
 	StepRouted        StepKind = "routed"
@@ -69,6 +70,7 @@ func NewStepLedger(hub *Hub) *StepLedger {
 	return &StepLedger{byID: make(map[string][]AgentStep), seen: make(map[string]struct{}), hub: hub}
 }
 
+// Record appends one step and broadcasts it to live subscribers.
 func (l *StepLedger) Record(step AgentStep) AgentStep {
 	if step.StepID == "" {
 		step.StepID = uuid.NewString()
@@ -87,6 +89,7 @@ func (l *StepLedger) Record(step AgentStep) AgentStep {
 	if l.seen == nil {
 		l.seen = make(map[string]struct{})
 	}
+	// Deduplicate by step id to avoid duplicates during JSONL replay/tailing.
 	if _, exists := l.seen[step.StepID]; exists {
 		l.mu.Unlock()
 		return step
@@ -111,6 +114,7 @@ func (l *StepLedger) Timeline(correlationID string) []AgentStep {
 	return out
 }
 
+// Queries returns one compact summary per correlation id for list views.
 func (l *StepLedger) Queries() []QuerySummary {
 	l.mu.RLock()
 	defer l.mu.RUnlock()

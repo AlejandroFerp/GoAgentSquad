@@ -10,6 +10,9 @@ import (
 	"github.com/embention/agent-squad-go/pkg/observability"
 )
 
+// This file implements the blackboard event bus used to intercept messages
+// before persistence and react to them after persistence.
+
 // EventType discriminates between the two interception points of the bus.
 type EventType string
 
@@ -48,6 +51,7 @@ func NewEventBus() *EventBus {
 // A pattern of "*" matches every message; otherwise the pattern is treated as
 // a regex matched against the message's identifying fields.
 func (b *EventBus) Subscribe(pattern string, cb any, eventType EventType) {
+	// A literal wildcard is normalized to a regex that matches every message.
 	regexSrc := ".*"
 	if pattern != "*" {
 		regexSrc = pattern
@@ -96,6 +100,7 @@ func (b *EventBus) EmitPreInsert(ctx context.Context, msg SynapseMessage) (*Syna
 		if !ok {
 			continue
 		}
+		// Pre-insert hooks form a mutation chain: each hook sees the previous output.
 		next, err := cb(ctx, *current)
 		if err != nil {
 			observability.LoggerFromContext(ctx).Error("synapse pre-insert callback blocked insertion",
@@ -146,6 +151,7 @@ func (b *EventBus) EmitPostInsert(ctx context.Context, msg SynapseMessage) {
 	}
 }
 
+// matches checks all message identity fields that observers commonly target.
 func (l listener) matches(msg *SynapseMessage) bool {
 	if l.patternStr == "*" {
 		return true
@@ -178,6 +184,7 @@ func sameFunc(a, b any) bool {
 	return fmt.Sprintf("%p", a) == fmt.Sprintf("%p", b) && funcType(a) == funcType(b)
 }
 
+// funcType normalizes function type strings before sameFunc comparison.
 func funcType(v any) string {
 	return strings.Replace(fmt.Sprintf("%T", v), " ", "", -1)
 }

@@ -8,6 +8,9 @@ import (
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
 
+// This file implements context compaction by emitting synthesis checkpoints
+// when a thread grows beyond a configured message threshold.
+
 // Synthesizer monitors context growth and compacts history when a threshold is
 // exceeded, posting a synthesis checkpoint message that slices future fetches.
 type Synthesizer struct {

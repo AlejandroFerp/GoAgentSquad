@@ -1,62 +1,152 @@
 # Agent Squad Go
 
-A Go port of the AGAPES Agent Squads framework and Synapse blackboard engine, redesigned for safe concurrent multi-threaded execution.
+A Go port of the AGAPES Agent Squads framework and Synapse blackboard engine, redesigned for safe concurrent multi-agent execution, traceability, and human-friendly observability.
+
+## What This Project Provides
+
+- A blackboard messaging engine (`pkg/synapse`) for context, task, and command messages.
+- A multi-agent orchestration layer (`pkg/squads`) with squads, subagents, transversal agents, observers, and final synthesis.
+- An observability layer (`pkg/observability`) that records spans, business-level steps, JSONL traces, correlated logs, and optional OpenTelemetry export.
+- A dashboard (`pkg/dashboard`) with REST endpoints, SSE live streaming, embedded web UI, graph projection, timeline, and metrics summaries.
+
+## Architecture At A Glance
+
+```mermaid
+flowchart LR
+	User[User Query] --> Pipeline[SquadsPipeline]
+	Pipeline --> Synapse[Synapse Blackboard]
+	Synapse --> Events[Pre/Post Insert EventBus]
+	Events --> Squads[Squads]
+	Squads --> Agents[SubAgents]
+	Agents --> Tools[Local Tools / Delegations]
+	Agents --> Transversals[Transversal Agents]
+	Squads --> Synth[Final Synthesizer]
+	Pipeline --> Result[QueryResult]
+
+	Pipeline -. records .-> Obs[Observability Runtime]
+	Agents -. records .-> Obs
+	Synapse -. carries trace metadata .-> Obs
+	Obs --> Ledger[StepLedger]
+	Ledger --> Dashboard[Dashboard REST + SSE]
+	Obs --> JSONL[JSONL Export/Replay]
+	Obs --> OTel[OpenTelemetry OTLP]
+```
 
 ## Project Structure
 
 ```
 agent-squad-go/
 ├── cmd/
-│   └── squad-demo/           # End-to-end demonstration
-│       └── main.go
+│   ├── squad-demo/           # End-to-end demo with optional dashboard, JSONL, and OTel
 │   └── squad-dashboard/      # Standalone dashboard for live or persisted traces
-│       └── main.go
 ├── pkg/
-│   ├── dashboard/            # HTTP API, SSE stream, embedded UI, graph projections
-│   ├── observability/        # Trace context, step ledger, hub, exporters, loaders
-│   ├── synapse/              # Core messaging engine (port of agapes_synapse)
-│   │   ├── models.go         # SynapseMessage, ContextMessage, TaskMessage, CommandMessage
-│   │   ├── events.go         # EventBus with pre/post-insert hooks and regex matching
-│   │   ├── storage.go        # BaseStorage interface + NoopStorage
-│   │   └── engine.go         # SynapseService: in-memory blackboard, cache, GC, atomic consume
-│   └── squads/               # Multi-agent collaboration framework (port of agent_squads)
-│       ├── blackboard.go     # BlackboardBus interface, SynapseBlackboardBus adapter, BoundedMap
-│       ├── metrics.go        # Thread-safe ExecutionMetrics with fine-grained mutexes
-│       ├── agent.go          # BaseAgent, SubAgent, TransversalAgent, LLM reasoning loop, tool healing
-│       ├── observer.go       # BaseObserver, ReferenceExpansionObserver
-│       ├── synthesizer.go    # Context compaction with synthesis checkpoints
-│       ├── squad.go          # Squad with concurrent sub-agent execution and coordination
-│       └── pipeline.go       # SquadsPipeline with tree quiescence detection and timeout
+│   ├── dashboard/            # REST API, SSE stream, embedded UI, graph/metrics projections
+│   ├── observability/        # Trace context, spans, step ledger, hub, exporters, OTel runtime
+│   ├── synapse/              # Core blackboard engine and persisted message model
+│   └── squads/               # Multi-agent orchestration framework
 ├── tests/
-│   ├── synapse/
-│   │   └── synapse_test.go   # EventBus, SendMessage, ConsumeTask, GC tests
-│   └── squads/
-│       └── squads_test.go    # BoundedMap, SubAgent, Observer, Squad, Metrics, ToolCall tests
+│   ├── dashboard/            # Dashboard graph/API/SSE/replay tests
+│   ├── observability/        # Tracing, logging, and OTel tests
+│   ├── squads/               # Agent, squad, metrics, tool, and propagation tests
+│   └── synapse/              # EventBus, SendMessage, ConsumeTask, GC tests
 ├── go.mod
-├── plan.md                   # Engineering plan and architecture analysis
 └── README.md
 ```
+
+## Package Responsibilities
+
+### `pkg/synapse`
+
+Synapse is the blackboard engine. It stores messages, emits lifecycle hooks, supports task consumption, and keeps trace metadata attached to persisted messages so asynchronous callbacks can reconstruct causality.
+
+- `models.go`: defines `SynapseMessage`, roles, message classes, trace metadata, and constructors for context/task/command messages.
+- `engine.go`: owns in-memory indexes, context cache, atomic task consumption, storage writes, post-insert dispatch, and TTL garbage collection.
+- `events.go`: implements the pre-insert/post-insert event bus used by observers, squads, and transversals.
+- `storage.go`: defines the persistence boundary (`BaseStorage`) plus the default in-memory-only `NoopStorage`.
+- `agent-squad.code-workspace`: local VS Code workspace helper.
+
+### `pkg/squads`
+
+Squads is the orchestration layer. It routes a query to one or more squads, runs subagents concurrently, delegates tasks, waits for the execution tree to become quiescent, and returns a traceable `QueryResult`.
+
+- `pipeline.go`: top-level coordinator, routing, lifecycle, quiescence detection, timeout, max-iteration guard, result assembly.
+- `squad.go`: squad event subscriptions, subagent fan-out, squad-level coordination, parent-thread replies.
+- `agent.go`: base agents, subagents, transversal agents, LLM loop, tool calls, delegation, tool-healing retries.
+- `blackboard.go`: blackboard abstraction, Synapse adapter, parent-thread map, bounded metrics store, observability runtime holder.
+- `metrics.go`: thread-safe execution metrics for squads, agents, observers, transversals, LLM usage, and delegations.
+- `observer.go`: pre-insert middleware, including reference expansion.
+- `synthesizer.go`: context compaction through synthesis checkpoints.
+- `telemetry.go`: shared observability helpers for spans, steps, correlated logging, and trace reconstruction from persisted messages.
+
+### `pkg/observability`
+
+Observability captures both infrastructure spans and human-readable business steps.
+
+- `tracer.go`: local `Tracer`/`Span` contracts, noop tracer, recorder tracer for tests, and OpenTelemetry adapter.
+- `otel_runtime.go`: OTLP gRPC provider/exporter setup driven by `SQUAD_OTEL_*` configuration.
+- `step.go`: `AgentStep`, step kinds, `StepLedger`, query summaries, deduplication, and live hub broadcast.
+- `hub.go`: non-blocking pub/sub for live dashboard updates.
+- `exporter.go`: stdout and JSONL export/import for replayable traces.
+- `context.go`: trace and step IDs carried through `context.Context`.
+- `logger.go`: `slog` enrichment with `trace_id`, `span_id`, `correlation_id`, `causation_id`, and `step_id`.
+- `attributes.go`: canonical attribute names shared by spans, logs, and dashboard projections.
+
+### `pkg/dashboard`
+
+The dashboard exposes observability data for humans.
+
+- `server.go`: HTTP server bootstrap, embedded UI, route registration, optional trace-file replay.
+- `api.go`: REST endpoints for query lists, timelines, graph data, and metrics summaries.
+- `sse.go`: Server-Sent Events stream for live `AgentStep` updates.
+- `graph.go`: transforms timelines into graph nodes/edges and summary metrics.
+- `model.go`: JSON contracts consumed by the web UI.
+- `web/`: static frontend assets embedded into the Go binary.
+
+## Execution Flow
+
+1. `SquadsPipeline.Query` receives the user query and creates the root trace context.
+2. The route function chooses the initial squad or squads.
+3. The pipeline writes user messages into Synapse squad threads.
+4. Synapse persists messages, stores trace metadata, and fires post-insert callbacks.
+5. Squads receive matching messages and run their subagents concurrently on isolated agent threads.
+6. Agents call the LLM, invoke local tools, or delegate tasks to transversals/other squads.
+7. Parent-child thread relationships are tracked through `ParentThreadMap`.
+8. The pipeline waits until the execution tree reaches quiescence or the query times out.
+9. The final synthesizer produces the response.
+10. Metrics, timeline steps, logs, JSONL traces, dashboard data, and optional OTel spans are available for inspection.
+
+## Loop And Completion Safety
+
+- The dashboard graph is observational only; it does not control execution depth.
+- `SquadsPipeline` prevents unbounded execution with `MaxIterations` and query timeout.
+- Quiescence is calculated by resolving the root thread, collecting all child threads, and checking active executions plus pending replies.
+- Task consumption in Synapse is atomic under a mutex so two workers cannot consume the same task concurrently.
 
 ## Key Design Decisions
 
 ### Thread Safety
-- All shared maps and counters are protected by `sync.RWMutex` or `sync.Mutex`.
-- `ExecutionMetrics` uses a single top-level mutex with internal locked helpers to avoid reentrant locking (Go mutexes are NOT reentrant).
-- `SynapseService` uses `sync.RWMutex` for read-heavy workloads (FetchContext) with exclusive locks for writes.
+
+- Shared maps and counters are protected by `sync.RWMutex`, `sync.Mutex`, or atomics.
+- `ExecutionMetrics` uses a single top-level mutex with internal locked helpers to avoid reentrant locking.
+- `SynapseService` uses `sync.RWMutex` for read-heavy context fetches and exclusive locks for writes/consumption.
 
 ### Concurrency Model
+
 - Python's `asyncio.gather` is replaced by `sync.WaitGroup` for concurrent sub-agent execution.
 - Post-insert callbacks run in independent goroutines with `recover()` guards.
-- The GC loop uses `time.Ticker` with `context.Context` cancellation.
+- Squads and transversals subscribe to Synapse events instead of being called directly by the pipeline.
 
-### Composition over Inheritance
-- Go has no inheritance. `BaseAgent` is embedded into `SubAgent` and `TransversalAgent`.
+### Composition Over Inheritance
+
+- `BaseAgent` is embedded into `SubAgent` and `TransversalAgent`.
 - `BlackboardBus` is a pure interface; `SynapseBlackboardBus` adapts `synapse.SynapseService`.
 
-### Quiescence Detection
-- The pipeline resolves the root thread by walking `ParentThreadMap`.
-- It checks active executions (atomic counters) and pending replies across all squads.
-- A `sync.WaitGroup` signals completion with timeout support.
+### Traceability
+
+- `TraceContext` is propagated through `context.Context` and persisted onto `SynapseMessage.Trace`.
+- Async callbacks rebuild trace linkage from message metadata.
+- `AgentStep` records business-level events while spans capture infrastructure-level timing.
+- Logs are correlated through `trace_id`, `span_id`, `correlation_id`, `causation_id`, and `step_id`.
 
 ## Running
 
@@ -100,8 +190,31 @@ go run ./cmd/squad-dashboard --addr 127.0.0.1:8080 --trace-file ./traces/agent-s
 
 The standalone dashboard tails the JSONL file incrementally and deduplicates steps by `step_id`, so you can refresh or reopen the UI without duplicating the visual timeline.
 
+## Dashboard API
+
+- `GET /api/queries`: returns query summaries plus metrics.
+- `GET /api/queries/{correlation_id}/timeline`: returns raw `AgentStep` entries.
+- `GET /api/queries/{correlation_id}/graph`: returns graph nodes and edges for visualization.
+- `GET /api/metrics/summary?query={correlation_id}`: returns aggregate duration, token, LLM/tool, agent, and error metrics.
+- `GET /api/stream`: opens an SSE stream of live `AgentStep` events.
+
+## OpenTelemetry
+
+OpenTelemetry is optional. The project pins OTel to the Go 1.22-compatible `v1.35.0` line. Newer OTel versions may raise the module Go baseline.
+
+When enabled, the demo builds an OTLP gRPC tracer provider and adapts it to the local `observability.Tracer` interface. JSONL and OTel can be enabled at the same time: JSONL is best for local replay/dashboard inspection, while OTel is best for external collectors such as Jaeger, Tempo, or an OpenTelemetry Collector.
+
 ## Testing
 
 ```bash
 go test ./... -v -count=1
+```
+
+Focused suites:
+
+```bash
+go test ./tests/synapse
+go test ./tests/squads
+go test ./tests/observability
+go test ./tests/dashboard
 ```

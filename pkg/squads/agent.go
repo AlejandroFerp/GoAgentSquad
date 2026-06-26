@@ -13,6 +13,9 @@ import (
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
 
+// This file contains agent-side behavior: local tool execution, delegation,
+// reasoning loop orchestration, and transversal task processing.
+
 // LLMCall is the function signature for invoking an LLM. It mirrors the Python
 // llm_call contract: it receives a model name, system prompt, and a slice of
 // message payloads, and returns a response map with content and token counts.
@@ -60,9 +63,9 @@ type BaseAgent struct {
 	Clock      func() float64
 }
 
-// NewBaseAgent creates a BaseAgent with a monotonic clock.
+// NewBaseAgent creates a BaseAgent with a monotonic elapsed-time clock.
 func NewBaseAgent(agentID string, bb BlackboardBus, squadID string) BaseAgent {
-	return BaseAgent{AgentID: agentID, Blackboard: bb, SquadID: squadID, Clock: nowSec}
+	return BaseAgent{AgentID: agentID, Blackboard: bb, SquadID: squadID, Clock: timeMonotonic}
 }
 
 // SendContextMessage posts a ContextMessage to the blackboard.
@@ -868,7 +871,9 @@ func (a *SubAgent) LogSystemContext(ctx context.Context, threadID, content strin
 	return err
 }
 
-// timeMonotonic returns a monotonic clock reading in seconds.
+var monotonicClockStart = time.Now()
+
+// timeMonotonic returns elapsed seconds using Go's monotonic time component.
 func timeMonotonic() float64 {
-	return float64(time.Now().UnixNano()) / 1e9
+	return time.Since(monotonicClockStart).Seconds()
 }

@@ -9,6 +9,9 @@ import (
 	"github.com/google/uuid"
 )
 
+// This file defines the serializable message model used by the Synapse
+// blackboard and convenience constructors for each message class.
+
 // Role enumerates the canonical message roles used across the blackboard.
 type Role string
 
@@ -122,6 +125,7 @@ func NewTaskMessage(threadID, agentID, taskType, replyToThread string, parameter
 		ttl = 3600
 	}
 	if maxConsumers == 0 {
+		// Task messages are single-consumer by default to avoid duplicate work.
 		maxConsumers = 1
 	}
 	msg := NewSynapseMessage(threadID, agentID, RoleAssistant, ClassTaskMessage)

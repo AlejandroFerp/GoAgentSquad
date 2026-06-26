@@ -5,6 +5,9 @@ import (
 	"time"
 )
 
+// This file provides the thread-safe metrics model used by squads, agents,
+// observers, and transversals during one pipeline execution.
+
 // AgentMetrics tracks per-agent execution stats in a thread-safe manner.
 type AgentMetrics struct {
 	mu               sync.Mutex
@@ -454,6 +457,7 @@ func nowSec() float64 {
 	return float64(time.Now().UnixNano()) / 1e9
 }
 
+// round truncates to a fixed number of decimals for stable metric output.
 func round(v float64, decimals int) float64 {
 	mul := 1.0
 	for i := 0; i < decimals; i++ {

@@ -10,11 +10,13 @@ import (
 	"sync"
 )
 
+// TraceExporter defines pluggable sinks for completed query timelines.
 type TraceExporter interface {
 	Export(ctx context.Context, steps []AgentStep) error
 	Shutdown(ctx context.Context) error
 }
 
+// StdoutExporter writes each step as one JSON line to an io.Writer.
 type StdoutExporter struct {
 	Writer io.Writer
 }
@@ -35,6 +37,7 @@ func (e StdoutExporter) Export(_ context.Context, steps []AgentStep) error {
 
 func (StdoutExporter) Shutdown(context.Context) error { return nil }
 
+// JSONFileExporter appends timelines to a local JSONL file.
 type JSONFileExporter struct {
 	mu   sync.Mutex
 	Path string
@@ -95,6 +98,7 @@ func (l *JSONFileLoader) Sync(ledger *StepLedger) error {
 	if err != nil {
 		return fmt.Errorf("stat trace input file %s: %w", l.Path, err)
 	}
+	// Reset offset when the file was rotated/truncated.
 	if info.Size() < l.offset {
 		l.offset = 0
 	}
@@ -109,6 +113,7 @@ func (l *JSONFileLoader) Sync(ledger *StepLedger) error {
 		if len(line) > 0 {
 			bytesRead += int64(len(line))
 			var step AgentStep
+			// Ignore malformed lines and keep replay moving.
 			if unmarshalErr := json.Unmarshal(line, &step); unmarshalErr == nil {
 				ledger.Record(step)
 			}
