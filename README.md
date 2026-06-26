@@ -9,7 +9,11 @@ agent-squad-go/
 ├── cmd/
 │   └── squad-demo/           # End-to-end demonstration
 │       └── main.go
+│   └── squad-dashboard/      # Standalone dashboard for live or persisted traces
+│       └── main.go
 ├── pkg/
+│   ├── dashboard/            # HTTP API, SSE stream, embedded UI, graph projections
+│   ├── observability/        # Trace context, step ledger, hub, exporters, loaders
 │   ├── synapse/              # Core messaging engine (port of agapes_synapse)
 │   │   ├── models.go         # SynapseMessage, ContextMessage, TaskMessage, CommandMessage
 │   │   ├── events.go         # EventBus with pre/post-insert hooks and regex matching
@@ -59,6 +63,42 @@ agent-squad-go/
 ```bash
 go run ./cmd/squad-demo/
 ```
+
+Optional runtime flags and environment variables:
+
+- `SQUAD_DASHBOARD_ADDR` starts the embedded observability dashboard inside the demo process.
+- `SQUAD_TRACE_JSONL` exports each completed query timeline to a JSONL file for later inspection.
+- `SQUAD_OTEL_ENABLED` turns on the OpenTelemetry tracer runtime in the demo.
+- `SQUAD_OTEL_ENDPOINT` points the OTLP gRPC exporter at a collector such as `127.0.0.1:4317`.
+- `SQUAD_OTEL_INSECURE` disables TLS for local collectors.
+- `SQUAD_OTEL_HEADERS` sets OTLP headers as a comma-separated `key=value` list.
+- `SQUAD_OTEL_SERVICE_NAME`, `SQUAD_OTEL_SERVICE_VERSION`, and `SQUAD_OTEL_TRACER_NAME` override the default resource and tracer identity.
+- `SQUAD_OTEL_BATCH_TIMEOUT` overrides the span batch timeout using Go duration syntax such as `250ms` or `2s`.
+
+Example workflow:
+
+1. Run the demo with a shared in-process dashboard.
+2. Enable `SQUAD_TRACE_JSONL` when you want durable traces.
+3. Enable `SQUAD_OTEL_ENABLED` plus an OTLP endpoint when you want the same spans exported to an external collector.
+4. Open the standalone dashboard against the exported file when you want to inspect traces outside the demo process.
+
+Example with both JSONL replay and OTLP export enabled:
+
+```powershell
+$env:SQUAD_TRACE_JSONL = ".\\traces\\agent-steps.jsonl"
+$env:SQUAD_OTEL_ENABLED = "true"
+$env:SQUAD_OTEL_ENDPOINT = "127.0.0.1:4317"
+$env:SQUAD_OTEL_INSECURE = "true"
+go run ./cmd/squad-demo/
+```
+
+Standalone dashboard:
+
+```bash
+go run ./cmd/squad-dashboard --addr 127.0.0.1:8080 --trace-file ./traces/agent-steps.jsonl
+```
+
+The standalone dashboard tails the JSONL file incrementally and deduplicates steps by `step_id`, so you can refresh or reopen the UI without duplicating the visual timeline.
 
 ## Testing
 

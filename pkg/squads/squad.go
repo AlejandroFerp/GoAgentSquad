@@ -3,11 +3,12 @@ package squads
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/embention/agent-squad-go/pkg/observability"
 	"github.com/embention/agent-squad-go/pkg/synapse"
 	"github.com/google/uuid"
 )
@@ -28,7 +29,7 @@ type Squad struct {
 	squadRuns          map[string]string // squad_thread_id -> parent_thread_id
 	threadToSquadMap   map[string]string
 	activeExecutions   map[string]*int32
-	completionCallback func(threadID string)
+	completionCallback func(ctx context.Context, threadID string)
 	subscribed         bool
 }
 
@@ -89,7 +90,7 @@ func (s *Squad) broadcastTopology() {
 }
 
 // RegisterCompletionCallback sets the callback invoked when a squad run finishes.
-func (s *Squad) RegisterCompletionCallback(cb func(threadID string)) {
+func (s *Squad) RegisterCompletionCallback(cb func(ctx context.Context, threadID string)) {
 	s.completionCallback = cb
 }
 
@@ -174,6 +175,7 @@ func (s *Squad) decrementActive(threadID string) int32 {
 }
 
 func (s *Squad) onContextMessage(ctx context.Context, msg synapse.SynapseMessage) {
+	ctx = contextWithMessageTrace(ctx, msg)
 	if msg.MessageClass != synapse.ClassContextMessage {
 		return
 	}
@@ -186,15 +188,16 @@ func (s *Squad) onContextMessage(ctx context.Context, msg synapse.SynapseMessage
 			agent.mu.Unlock()
 			if pending {
 				squadThreadID := msg.ThreadID
+				replyCtx := ctx
 				go func() {
 					s.incrementActive(squadThreadID)
 					defer func() {
 						s.decrementActive(squadThreadID)
 						if s.completionCallback != nil {
-							s.completionCallback(squadThreadID)
+							s.completionCallback(replyCtx, squadThreadID)
 						}
 					}()
-					agent.HandleReply(context.Background(), msg.ThreadID, &msg)
+					agent.HandleReply(replyCtx, msg.ThreadID, &msg)
 				}()
 				return
 			}
@@ -222,22 +225,28 @@ func (s *Squad) onContextMessage(ctx context.Context, msg synapse.SynapseMessage
 		s.mu.Lock()
 		s.threadToSquadMap[msg.ThreadID] = squadID
 		s.mu.Unlock()
+		runCtx := ctx
 		go func() {
 			s.incrementActive(msg.ThreadID)
 			defer func() {
 				s.decrementActive(msg.ThreadID)
 				if s.completionCallback != nil {
-					s.completionCallback(msg.ThreadID)
+					s.completionCallback(runCtx, msg.ThreadID)
 				}
 			}()
-			if err := s.Run(context.Background(), msg.ThreadID, &msg); err != nil {
-				log.Printf("squad '%s' run error: %v", s.SquadID, err)
+			if err := s.Run(runCtx, msg.ThreadID, &msg); err != nil {
+				observedLogger(runCtx, s.Blackboard).Error("squad run failed",
+					"squad_id", s.SquadID,
+					"thread_id", msg.ThreadID,
+					"error", err,
+				)
 			}
 		}()
 	}
 }
 
 func (s *Squad) onTaskMessage(ctx context.Context, msg synapse.SynapseMessage) {
+	ctx = contextWithMessageTrace(ctx, msg)
 	if msg.MessageClass != synapse.ClassTaskMessage {
 		return
 	}
@@ -245,7 +254,7 @@ func (s *Squad) onTaskMessage(ctx context.Context, msg synapse.SynapseMessage) {
 		return
 	}
 
-	consumed, err := s.Blackboard.ConsumeTask(context.Background(), msg.ThreadID, s.SquadID, "", 1)
+	consumed, err := s.Blackboard.ConsumeTask(ctx, msg.ThreadID, s.SquadID, "", 1)
 	if err != nil || len(consumed) == 0 {
 		return
 	}
@@ -269,12 +278,17 @@ func (s *Squad) onTaskMessage(ctx context.Context, msg synapse.SynapseMessage) {
 			}
 		}
 		userMsg := synapse.NewContextMessage(squadThreadID, "user-client", synapse.RoleUser, query, s.SquadID, nil, 3600)
-		_, _ = s.Blackboard.SendMessage(context.Background(), userMsg)
+		_, _ = s.Blackboard.SendMessage(ctx, userMsg)
 	}
 }
 
 // Run executes all registered sub-agents concurrently on isolated threads.
 func (s *Squad) Run(ctx context.Context, squadThreadID string, triggerMsg *synapse.SynapseMessage) error {
+	ctx, span := startObservedSpan(ctx, s.Blackboard, "squad.run",
+		observability.Attr{Key: observability.AttrSquadID, Value: s.SquadID},
+		observability.Attr{Key: observability.AttrThreadID, Value: squadThreadID},
+	)
+	defer span.End()
 	metrics := s.Blackboard.GetMetrics(squadThreadID)
 	if metrics != nil {
 		metrics.RecordSquadStart(s.SquadID)
@@ -309,7 +323,11 @@ func (s *Squad) runAgentFlow(ctx context.Context, agent *SubAgent, squadThreadID
 
 	for _, hook := range agent.PreRunHooks {
 		if err := hook.Execute(ctx, agent, subagentThreadID, triggerMsg); err != nil {
-			log.Printf("pre-run hook error for agent '%s': %v", agent.AgentID, err)
+			observedLogger(ctx, s.Blackboard).Error("subagent pre-run hook failed",
+				"agent_id", agent.AgentID,
+				"thread_id", subagentThreadID,
+				"error", err,
+			)
 		}
 	}
 
@@ -331,6 +349,11 @@ func (s *Squad) runAgentFlow(ctx context.Context, agent *SubAgent, squadThreadID
 // DoCoordination compiles responses from subagents and forwards a cohesive
 // response to the parent thread.
 func (s *Squad) DoCoordination(ctx context.Context, squadThreadID, parentThreadID string) error {
+	ctx, span := startObservedSpan(ctx, s.Blackboard, "squad.coordination",
+		observability.Attr{Key: observability.AttrSquadID, Value: s.SquadID},
+		observability.Attr{Key: observability.AttrThreadID, Value: squadThreadID},
+	)
+	defer span.End()
 	messages, err := s.Blackboard.FetchContext(ctx, squadThreadID, 100)
 	if err != nil {
 		return err
@@ -346,7 +369,10 @@ func (s *Squad) DoCoordination(ctx context.Context, squadThreadID, parentThreadI
 	}
 
 	if len(assistantMsgs) == 0 {
-		log.Printf("squad '%s' coordinator found no assistant messages to forward.", s.SquadID)
+		observedLogger(ctx, s.Blackboard).Warn("squad coordinator found no assistant messages",
+			"squad_id", s.SquadID,
+			"thread_id", squadThreadID,
+		)
 		return nil
 	}
 
@@ -387,13 +413,28 @@ func (s *Squad) DoCoordination(ctx context.Context, squadThreadID, parentThreadI
 			s.Name, joinedResponses)
 		res, err := llm(ctx, model, coordinatorPrompt, nil)
 		if err != nil {
-			log.Printf("squad coordinator LLM call failed: %v. Falling back to joined responses.", err)
+			observedLogger(ctx, s.Blackboard).Warn("squad coordinator llm call failed; falling back to joined responses",
+				"squad_id", s.SquadID,
+				"thread_id", squadThreadID,
+				"model", model,
+				"error", err,
+			)
 		} else {
 			if c, ok := res["content"].(string); ok && c != "" {
 				summary = strings.TrimSpace(c)
 			}
 		}
 	}
+	stepTime := time.Now()
+	ctx, _ = recordObservedStep(ctx, s.Blackboard, observability.AgentStep{
+		Kind:       observability.StepSynthesis,
+		AgentID:    s.SquadID + "-coordinator",
+		SquadID:    s.SquadID,
+		ThreadID:   parentThreadID,
+		Summary:    observedSummary(summary),
+		StartedAt:  stepTime,
+		FinishedAt: stepTime,
+	})
 
 	out := synapse.NewContextMessage(parentThreadID, s.SquadID+"-coordinator", synapse.RoleAssistant, summary, s.SquadID, nil, 3600)
 	_, _ = s.Blackboard.SendMessage(ctx, out)

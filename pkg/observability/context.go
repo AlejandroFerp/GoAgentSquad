@@ -35,3 +35,23 @@ func StepIDFromContext(ctx context.Context) (string, bool) {
 	stepID, ok := ctx.Value(stepContextKey{}).(string)
 	return stepID, ok
 }
+
+// WithTraceMetadata overlays trace fields from persisted message metadata while
+// preserving any values already present in ctx.
+func WithTraceMetadata(ctx context.Context, trace TraceContext) context.Context {
+	if current, ok := TraceFromContext(ctx); ok {
+		if trace.TraceID == "" {
+			trace.TraceID = current.TraceID
+		}
+		if trace.SpanID == "" {
+			trace.SpanID = current.SpanID
+		}
+		if trace.CausationID == "" {
+			trace.CausationID = current.CausationID
+		}
+		if trace.CorrelationID == "" {
+			trace.CorrelationID = current.CorrelationID
+		}
+	}
+	return WithTraceContext(ctx, trace)
+}

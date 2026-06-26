@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/embention/agent-squad-go/pkg/observability"
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
 
@@ -69,6 +69,18 @@ func NewBaseAgent(agentID string, bb BlackboardBus, squadID string) BaseAgent {
 func (b *BaseAgent) SendContextMessage(ctx context.Context, threadID, content string, role synapse.Role, citations []any, squadID string) (*synapse.SynapseMessage, error) {
 	if squadID == "" {
 		squadID = b.SquadID
+	}
+	if role == synapse.RoleAssistant {
+		stepTime := time.Now()
+		ctx, _ = recordObservedStep(ctx, b.Blackboard, observability.AgentStep{
+			Kind:       observability.StepResponded,
+			AgentID:    b.AgentID,
+			SquadID:    squadID,
+			ThreadID:   threadID,
+			Summary:    observedSummary(content),
+			StartedAt:  stepTime,
+			FinishedAt: stepTime,
+		})
 	}
 	msg := synapse.NewContextMessage(threadID, b.AgentID, role, content, squadID, citations, 3600)
 	return b.Blackboard.SendMessage(ctx, msg)
@@ -255,6 +267,25 @@ func (a *SubAgent) Delegate(ctx context.Context, threadID, taskType, replyToThre
 		metrics.RecordDelegation(a.AgentID, destination, delegationType, parameters)
 	}
 
+	stepTime := time.Now()
+	summary := taskType
+	if squadID != "" {
+		summary = fmt.Sprintf("delegate to squad %s (%s)", squadID, taskType)
+	} else {
+		summary = fmt.Sprintf("delegate transversal %s", taskType)
+	}
+	ctx, _ = recordObservedStep(ctx, a.Blackboard, observability.AgentStep{
+		Kind:       observability.StepDelegated,
+		AgentID:    a.AgentID,
+		AgentType:  a.AgentType,
+		SquadID:    a.SquadID,
+		ThreadID:   threadID,
+		Summary:    summary,
+		ToolName:   taskType,
+		StartedAt:  stepTime,
+		FinishedAt: stepTime,
+	})
+
 	return a.CallToolDelegate(ctx, threadID, taskType, replyToThread, parameters, squadID, respondThreadID)
 }
 
@@ -289,6 +320,24 @@ func (a *SubAgent) ExecuteInstrumented(ctx context.Context, threadID string, tri
 			return
 		}
 	}
+	ctx, span := startObservedSpan(ctx, a.Blackboard, "agent.execute",
+		observability.Attr{Key: observability.AttrAgentID, Value: a.AgentID},
+		observability.Attr{Key: observability.AttrAgentType, Value: a.AgentType},
+		observability.Attr{Key: observability.AttrSquadID, Value: a.SquadID},
+		observability.Attr{Key: observability.AttrThreadID, Value: threadID},
+	)
+	defer span.End()
+	stepStartedAt := time.Now()
+	ctx, _ = recordObservedStep(ctx, a.Blackboard, observability.AgentStep{
+		Kind:       observability.StepAgentStarted,
+		AgentID:    a.AgentID,
+		AgentType:  a.AgentType,
+		SquadID:    a.SquadID,
+		ThreadID:   threadID,
+		Summary:    "agent execution started",
+		StartedAt:  stepStartedAt,
+		FinishedAt: stepStartedAt,
+	})
 	metrics := a.Blackboard.GetMetrics(threadID)
 	if metrics != nil {
 		metrics.RecordSubagentStart(a.SquadID, a.AgentID)
@@ -301,7 +350,26 @@ func (a *SubAgent) ExecuteInstrumented(ctx context.Context, threadID string, tri
 		}
 	}()
 	if err := a.Execute(ctx, threadID, triggerMsg, respondThreadID); err != nil {
-		log.Printf("agent '%s' execute error: %v", a.AgentID, err)
+		span.RecordError(err)
+		stepTime := time.Now()
+		_, _ = recordObservedStep(ctx, a.Blackboard, observability.AgentStep{
+			Kind:       observability.StepError,
+			AgentID:    a.AgentID,
+			AgentType:  a.AgentType,
+			SquadID:    a.SquadID,
+			ThreadID:   threadID,
+			Summary:    observedSummary(err.Error()),
+			Error:      err.Error(),
+			StartedAt:  stepTime,
+			FinishedAt: stepTime,
+		})
+		observedLogger(ctx, a.Blackboard).Error("agent execution failed",
+			"agent_id", a.AgentID,
+			"agent_type", a.AgentType,
+			"squad_id", a.SquadID,
+			"thread_id", threadID,
+			"error", err,
+		)
 	}
 }
 
@@ -370,16 +438,9 @@ func (a *SubAgent) RunReasoningLoop(ctx context.Context, threadID, userQuery, re
 	}
 
 	systemPrompt := a.injectToolDefinitions(a.SystemPrompt)
-
-	startLLM := a.Clock()
-	res, err := a.LLMCall(ctx, a.Model, systemPrompt, messagesPayload)
+	res, err := a.callLLMObserved(ctx, threadID, systemPrompt, messagesPayload)
 	if err != nil {
 		return err
-	}
-	llmElapsed := a.Clock() - startLLM
-	metrics := a.Blackboard.GetMetrics(threadID)
-	if metrics != nil {
-		metrics.RecordLLMUsage(a.SquadID, a.AgentID, getInt(res, "prompt_tokens"), getInt(res, "completion_tokens"), getInt(res, "total_tokens"), llmElapsed)
 	}
 
 	content, _ := res["content"].(string)
@@ -402,6 +463,18 @@ func (a *SubAgent) RunReasoningLoop(ctx context.Context, threadID, userQuery, re
 		a.mu.Unlock()
 
 		if isLocal {
+			toolStartedAt := time.Now()
+			ctx, _ = recordObservedStep(ctx, a.Blackboard, observability.AgentStep{
+				Kind:       observability.StepToolCall,
+				AgentID:    a.AgentID,
+				AgentType:  a.AgentType,
+				SquadID:    a.SquadID,
+				ThreadID:   threadID,
+				Summary:    fmt.Sprintf("local tool %s called", toolName),
+				ToolName:   toolName,
+				StartedAt:  toolStartedAt,
+				FinishedAt: toolStartedAt,
+			})
 			result, err := a.executeToolWithHealing(ctx, threadID, toolName, arguments)
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
@@ -410,12 +483,7 @@ func (a *SubAgent) RunReasoningLoop(ctx context.Context, threadID, userQuery, re
 				"role":    "user",
 				"content": fmt.Sprintf("[System]: Tool %s returned result: %s", toolName, result),
 			})
-			startLLM2 := a.Clock()
-			finalRes, err := a.LLMCall(ctx, a.Model, a.SystemPrompt+"\nIntegrate the tool result into your final response.", messagesPayload)
-			llmElapsed2 := a.Clock() - startLLM2
-			if metrics != nil {
-				metrics.RecordLLMUsage(a.SquadID, a.AgentID, getInt(finalRes, "prompt_tokens"), getInt(finalRes, "completion_tokens"), getInt(finalRes, "total_tokens"), llmElapsed2)
-			}
+			finalRes, err := a.callLLMObserved(ctx, threadID, a.SystemPrompt+"\nIntegrate the tool result into your final response.", messagesPayload)
 			if err != nil {
 				return err
 			}
@@ -461,6 +529,17 @@ func (a *SubAgent) HandleReply(ctx context.Context, replyThreadID string, replyM
 	if metrics != nil {
 		metrics.RecordSubagentResumed(a.SquadID, a.AgentID, replyThreadID)
 	}
+	stepTime := time.Now()
+	ctx, _ = recordObservedStep(ctx, a.Blackboard, observability.AgentStep{
+		Kind:       observability.StepReplyReceived,
+		AgentID:    a.AgentID,
+		AgentType:  a.AgentType,
+		SquadID:    a.SquadID,
+		ThreadID:   origThread,
+		Summary:    "reply received from delegated task",
+		StartedAt:  stepTime,
+		FinishedAt: stepTime,
+	})
 	start := a.Clock()
 	defer func() {
 		elapsed := a.Clock() - start
@@ -470,7 +549,13 @@ func (a *SubAgent) HandleReply(ctx context.Context, replyThreadID string, replyM
 	}()
 	if a.ResumeFn != nil {
 		if err := a.ResumeFn(ctx, replyThreadID, replyMsg, resumptionCtx); err != nil {
-			log.Printf("agent '%s' resume error: %v", a.AgentID, err)
+			observedLogger(ctx, a.Blackboard).Error("agent resume failed",
+				"agent_id", a.AgentID,
+				"agent_type", a.AgentType,
+				"squad_id", a.SquadID,
+				"reply_thread_id", replyThreadID,
+				"error", err,
+			)
 		}
 		return
 	}
@@ -570,6 +655,48 @@ func (a *SubAgent) askLLMToHeal(ctx context.Context, threadID, toolName string, 
 	return failedArgs, nil
 }
 
+func (a *SubAgent) callLLMObserved(ctx context.Context, threadID, systemPrompt string, messages []map[string]any) (map[string]any, error) {
+	if a.LLMCall == nil {
+		return nil, nil
+	}
+	llmCtx, span := startObservedSpan(ctx, a.Blackboard, "agent.llm",
+		observability.Attr{Key: observability.AttrAgentID, Value: a.AgentID},
+		observability.Attr{Key: observability.AttrAgentType, Value: a.AgentType},
+		observability.Attr{Key: observability.AttrSquadID, Value: a.SquadID},
+		observability.Attr{Key: observability.AttrThreadID, Value: threadID},
+		observability.Attr{Key: observability.AttrModel, Value: a.Model},
+	)
+	startedAt := time.Now()
+	clockStart := a.Clock()
+	res, err := a.LLMCall(llmCtx, a.Model, systemPrompt, messages)
+	clockElapsed := a.Clock() - clockStart
+	finishedAt := time.Now()
+	metrics := a.Blackboard.GetMetrics(threadID)
+	if metrics != nil {
+		metrics.RecordLLMUsage(a.SquadID, a.AgentID, getInt(res, "prompt_tokens"), getInt(res, "completion_tokens"), getInt(res, "total_tokens"), clockElapsed)
+	}
+	step := observability.AgentStep{
+		Kind:       observability.StepLLMCall,
+		AgentID:    a.AgentID,
+		AgentType:  a.AgentType,
+		SquadID:    a.SquadID,
+		ThreadID:   threadID,
+		Summary:    "llm call",
+		Model:      a.Model,
+		TokensIn:   getInt(res, "prompt_tokens"),
+		TokensOut:  getInt(res, "completion_tokens"),
+		StartedAt:  startedAt,
+		FinishedAt: finishedAt,
+	}
+	if err != nil {
+		span.RecordError(err)
+		step.Error = err.Error()
+	}
+	_, _ = recordObservedStep(llmCtx, a.Blackboard, step)
+	span.End()
+	return res, err
+}
+
 // TransversalAgent is a global, shared utility agent that runs outside squads.
 type TransversalAgent struct {
 	BaseAgent
@@ -591,6 +718,22 @@ func NewTransversalAgent(agentID, agentType string, capabilities []string, bb Bl
 // ProcessTask runs the transversal task logic and replies to the reply thread.
 func (t *TransversalAgent) ProcessTask(ctx context.Context, taskMsg *synapse.SynapseMessage) {
 	threadID := taskMsg.ThreadID
+	ctx, span := startObservedSpan(ctx, t.Blackboard, "transversal.process_task",
+		observability.Attr{Key: observability.AttrAgentID, Value: t.AgentID},
+		observability.Attr{Key: observability.AttrAgentType, Value: t.AgentType},
+		observability.Attr{Key: observability.AttrThreadID, Value: threadID},
+	)
+	defer span.End()
+	stepTime := time.Now()
+	ctx, _ = recordObservedStep(ctx, t.Blackboard, observability.AgentStep{
+		Kind:       observability.StepAgentStarted,
+		AgentID:    t.AgentID,
+		AgentType:  t.AgentType,
+		ThreadID:   threadID,
+		Summary:    "transversal task started",
+		StartedAt:  stepTime,
+		FinishedAt: stepTime,
+	})
 	metrics := t.Blackboard.GetMetrics(threadID)
 	if metrics != nil {
 		metrics.RecordTransversalStart(t.AgentID)
@@ -610,6 +753,18 @@ func (t *TransversalAgent) ProcessTask(ctx context.Context, taskMsg *synapse.Syn
 
 	result, err := t.ExecuteTask(ctx, taskMsg)
 	if err != nil {
+		span.RecordError(err)
+		errTime := time.Now()
+		_, _ = recordObservedStep(ctx, t.Blackboard, observability.AgentStep{
+			Kind:       observability.StepError,
+			AgentID:    t.AgentID,
+			AgentType:  t.AgentType,
+			ThreadID:   threadID,
+			Summary:    observedSummary(err.Error()),
+			Error:      err.Error(),
+			StartedAt:  errTime,
+			FinishedAt: errTime,
+		})
 		_, _ = t.SendContextMessage(ctx, taskMsg.ReplyToThread(), fmt.Sprintf("Error executing transversal task: %v", err), synapse.RoleSystem, nil, "")
 		return
 	}

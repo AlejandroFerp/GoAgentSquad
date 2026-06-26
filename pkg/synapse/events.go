@@ -3,10 +3,11 @@ package synapse
 import (
 	"context"
 	"fmt"
-	"log"
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/embention/agent-squad-go/pkg/observability"
 )
 
 // EventType discriminates between the two interception points of the bus.
@@ -97,7 +98,11 @@ func (b *EventBus) EmitPreInsert(ctx context.Context, msg SynapseMessage) (*Syna
 		}
 		next, err := cb(ctx, *current)
 		if err != nil {
-			log.Printf("synapse: pre-insert callback blocked insertion: %v", err)
+			observability.LoggerFromContext(ctx).Error("synapse pre-insert callback blocked insertion",
+				"message_id", current.ID,
+				"thread_id", current.ThreadID,
+				"error", err,
+			)
 			return nil, err
 		}
 		if next == nil {
@@ -129,7 +134,11 @@ func (b *EventBus) EmitPostInsert(ctx context.Context, msg SynapseMessage) {
 		go func(cb PostInsertCallback, m SynapseMessage) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("synapse: post-insert callback panicked: %v", r)
+					observability.LoggerFromContext(ctx).Error("synapse post-insert callback panicked",
+						"message_id", m.ID,
+						"thread_id", m.ThreadID,
+						"panic", r,
+					)
 				}
 			}()
 			cb(ctx, m)

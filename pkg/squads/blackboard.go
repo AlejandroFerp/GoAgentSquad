@@ -5,8 +5,10 @@ package squads
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
+	"github.com/embention/agent-squad-go/pkg/observability"
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
 
@@ -34,6 +36,39 @@ type PipelineMetrics interface {
 	ToDict() map[string]any
 }
 
+// ObservabilityRuntime groups the optional tracing and timeline components.
+// The zero-value is normalized by ensureDefaults so callers can use it safely.
+type ObservabilityRuntime struct {
+	Tracer   observability.Tracer
+	Hub      *observability.Hub
+	Ledger   *observability.StepLedger
+	Exporter observability.TraceExporter
+	Logger   *slog.Logger
+}
+
+func NewObservabilityRuntime() *ObservabilityRuntime {
+	return (&ObservabilityRuntime{}).ensureDefaults()
+}
+
+func (r *ObservabilityRuntime) ensureDefaults() *ObservabilityRuntime {
+	if r == nil {
+		r = &ObservabilityRuntime{}
+	}
+	if r.Tracer == nil {
+		r.Tracer = observability.NoopTracer{}
+	}
+	if r.Hub == nil {
+		r.Hub = observability.NewHub()
+	}
+	if r.Ledger == nil {
+		r.Ledger = observability.NewStepLedger(r.Hub)
+	}
+	if r.Logger == nil {
+		r.Logger = observability.NewTextLogger(nil, nil)
+	}
+	return r
+}
+
 // BlackboardBus is the abstract contract that decouples squads from the
 // concrete SynapseService implementation.
 type BlackboardBus interface {
@@ -45,6 +80,7 @@ type BlackboardBus interface {
 	FetchContext(ctx context.Context, threadID string, limit int) ([]synapse.SynapseMessage, error)
 	ConsumeTask(ctx context.Context, threadID, squadID, taskType string, limit int) ([]synapse.SynapseMessage, error)
 	ParentThreads() *ParentThreadMap
+	Observability() *ObservabilityRuntime
 }
 
 // ParentThreadMap tracks the parent-child relationship between reply threads and
@@ -100,6 +136,7 @@ type SynapseBlackboardBus struct {
 	synapse      *synapse.SynapseService
 	metricsStore *BoundedMap
 	parents      *ParentThreadMap
+	obs          *ObservabilityRuntime
 }
 
 // NewSynapseBlackboardBus wraps a SynapseService into a BlackboardBus.
@@ -108,6 +145,7 @@ func NewSynapseBlackboardBus(svc *synapse.SynapseService) *SynapseBlackboardBus 
 		synapse:      svc,
 		metricsStore: NewBoundedMap(100),
 		parents:      NewParentThreadMap(),
+		obs:          NewObservabilityRuntime(),
 	}
 }
 
@@ -150,6 +188,11 @@ func (b *SynapseBlackboardBus) ConsumeTask(ctx context.Context, threadID, squadI
 }
 
 func (b *SynapseBlackboardBus) ParentThreads() *ParentThreadMap { return b.parents }
+
+func (b *SynapseBlackboardBus) Observability() *ObservabilityRuntime {
+	b.obs = b.obs.ensureDefaults()
+	return b.obs
+}
 
 // BoundedMap is a thread-safe map with a maximum size. When full, the oldest
 // key (by insertion order) is evicted. It mirrors the Python BoundedDict.

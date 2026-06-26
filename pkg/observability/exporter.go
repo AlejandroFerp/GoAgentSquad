@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -60,3 +61,65 @@ func (e *JSONFileExporter) Export(_ context.Context, steps []AgentStep) error {
 }
 
 func (*JSONFileExporter) Shutdown(context.Context) error { return nil }
+
+// JSONFileLoader incrementally loads step traces from a JSONL file. It keeps an
+// internal byte offset so repeated Sync calls only ingest newly appended lines.
+type JSONFileLoader struct {
+	mu     sync.Mutex
+	Path   string
+	offset int64
+}
+
+// Sync reads newly appended JSONL steps from Path and records them into ledger.
+func (l *JSONFileLoader) Sync(ledger *StepLedger) error {
+	if l == nil || ledger == nil {
+		return nil
+	}
+	if l.Path == "" {
+		return fmt.Errorf("json trace loader path is empty")
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	file, err := os.Open(l.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("open trace input file %s: %w", l.Path, err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat trace input file %s: %w", l.Path, err)
+	}
+	if info.Size() < l.offset {
+		l.offset = 0
+	}
+	if _, err := file.Seek(l.offset, io.SeekStart); err != nil {
+		return fmt.Errorf("seek trace input file %s: %w", l.Path, err)
+	}
+
+	reader := bufio.NewReader(file)
+	bytesRead := int64(0)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			bytesRead += int64(len(line))
+			var step AgentStep
+			if unmarshalErr := json.Unmarshal(line, &step); unmarshalErr == nil {
+				ledger.Record(step)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read trace input file %s: %w", l.Path, err)
+		}
+	}
+	l.offset += bytesRead
+	return nil
+}

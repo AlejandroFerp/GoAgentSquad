@@ -3,10 +3,11 @@ package squads
 import (
 	"context"
 	"fmt"
-	"log"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/embention/agent-squad-go/pkg/observability"
 	"github.com/embention/agent-squad-go/pkg/synapse"
 	"github.com/google/uuid"
 )
@@ -66,6 +67,7 @@ func (r *TransversalRunner) Stop() {
 }
 
 func (r *TransversalRunner) onPostInsert(ctx context.Context, msg synapse.SynapseMessage) {
+	ctx = contextWithMessageTrace(ctx, msg)
 	if msg.MessageClass != synapse.ClassTaskMessage {
 		return
 	}
@@ -77,7 +79,7 @@ func (r *TransversalRunner) onPostInsert(ctx context.Context, msg synapse.Synaps
 		return
 	}
 
-	consumed, err := r.Blackboard.ConsumeTask(context.Background(), msg.ThreadID, "", taskType, 1)
+	consumed, err := r.Blackboard.ConsumeTask(ctx, msg.ThreadID, "", taskType, 1)
 	if err != nil || len(consumed) == 0 {
 		return
 	}
@@ -96,14 +98,20 @@ func (r *TransversalRunner) onPostInsert(ctx context.Context, msg synapse.Synaps
 			continue
 		}
 		taskCopy := task
-		go func(a *TransversalAgent, t synapse.SynapseMessage) {
+		taskCtx := contextWithMessageTrace(ctx, taskCopy)
+		go func(a *TransversalAgent, t synapse.SynapseMessage, taskCtx context.Context) {
 			defer func() {
 				if rec := recover(); rec != nil {
-					log.Printf("transversal agent '%s' panicked: %v", a.AgentID, rec)
+					observedLogger(taskCtx, r.Blackboard).Error("transversal agent panicked",
+						"agent_id", a.AgentID,
+						"thread_id", t.ThreadID,
+						"task_type", t.TaskType(),
+						"panic", rec,
+					)
 				}
 			}()
-			a.ProcessTask(context.Background(), &t)
-		}(agent, taskCopy)
+			a.ProcessTask(taskCtx, &t)
+		}(agent, taskCopy, taskCtx)
 	}
 }
 
@@ -312,13 +320,16 @@ func (p *SquadsPipeline) isTreeQuiescent(rootThread string) bool {
 	return true
 }
 
-func (p *SquadsPipeline) onSquadExecutionComplete(threadID string) {
+func (p *SquadsPipeline) onSquadExecutionComplete(ctx context.Context, threadID string) {
 	rootThread := p.resolveRootThread(threadID)
 
 	p.mu.Lock()
 	p.iterationCounter[rootThread]++
 	if p.iterationCounter[rootThread] > p.MaxIterations {
-		log.Printf("pipeline run on thread '%s' exceeded maximum iterations (%d).", rootThread, p.MaxIterations)
+		observedLogger(ctx, p.Blackboard).Error("pipeline exceeded maximum iterations",
+			"thread_id", rootThread,
+			"max_iterations", p.MaxIterations,
+		)
 		p.exceptions[rootThread] = fmt.Errorf("execution aborted: exceeded maximum iteration limit of %d steps", p.MaxIterations)
 		if wg, ok := p.completionEvents[rootThread]; ok {
 			wg.Done()
@@ -345,27 +356,40 @@ func (p *SquadsPipeline) onSquadExecutionComplete(threadID string) {
 			}
 		}
 		if targetSquad != nil && parentThread != "" {
-			go func(sq *Squad, stID, ptID string) {
-				_ = sq.DoCoordination(context.Background(), stID, ptID)
-				p.checkGlobalQuiescence(rootThread)
-			}(targetSquad, threadID, parentThread)
+			go func(sq *Squad, coordCtx context.Context, stID, ptID string) {
+				if err := sq.DoCoordination(coordCtx, stID, ptID); err != nil {
+					observedLogger(coordCtx, p.Blackboard).Error("squad coordination failed",
+						"squad_id", sq.SquadID,
+						"thread_id", stID,
+						"parent_thread_id", ptID,
+						"error", err,
+					)
+				}
+				p.checkGlobalQuiescence(coordCtx, rootThread)
+			}(targetSquad, ctx, threadID, parentThread)
 			return
 		}
 	}
-	p.checkGlobalQuiescence(rootThread)
+	p.checkGlobalQuiescence(ctx, rootThread)
 }
 
-func (p *SquadsPipeline) checkGlobalQuiescence(rootThread string) {
+func (p *SquadsPipeline) checkGlobalQuiescence(ctx context.Context, rootThread string) {
 	if !p.isTreeQuiescent(rootThread) {
 		return
 	}
 	p.mu.Lock()
 	squadID := p.threadToSquadMap[rootThread]
 	if p.FinalSynthesizer != nil {
-		go func() {
-			_ = p.FinalSynthesizer.Synthesize(context.Background(), rootThread, squadID)
+		go func(synthCtx context.Context) {
+			if err := p.FinalSynthesizer.Synthesize(synthCtx, rootThread, squadID); err != nil {
+				observedLogger(synthCtx, p.Blackboard).Error("final synthesis failed",
+					"thread_id", rootThread,
+					"squad_id", squadID,
+					"error", err,
+				)
+			}
 			p.signalCompletion(rootThread, squadID)
-		}()
+		}(ctx)
 		p.mu.Unlock()
 		return
 	}
@@ -420,20 +444,56 @@ type QueryResult struct {
 	History      []synapse.SynapseMessage
 	SquadThreads map[string]string
 	Metrics      map[string]any
+	Timeline     []observability.AgentStep
+	Metadata     QueryMetadata
+}
+
+// QueryMetadata carries the high-level traceable metadata of a Query result.
+type QueryMetadata struct {
+	CorrelationID    string
+	ThreadID         string
+	RespondingSquads []string
+	TraceID          string
+	DurationMS       int64
+	TotalSteps       int
 }
 
 // Query runs the full concurrent agent squads pipeline.
 func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSquadID any, content string, timeout float64) (*QueryResult, error) {
+	queryStartedAt := time.Now()
 	if threadID == "" {
 		threadID = "thread-" + uuid.NewString()
 	}
 	if timeout <= 0 {
 		timeout = 10.0
 	}
+	ctx = observability.WithTraceContext(ctx, observability.TraceContext{CorrelationID: threadID})
+	ctx, rootSpan := startObservedSpan(ctx, p.Blackboard, "pipeline.query",
+		observability.Attr{Key: observability.AttrCorrelationID, Value: threadID},
+		observability.Attr{Key: observability.AttrThreadID, Value: threadID},
+	)
+	defer rootSpan.End()
+	ctx, rootStep := recordObservedStep(ctx, p.Blackboard, observability.AgentStep{
+		Kind:       observability.StepQueryReceived,
+		ThreadID:   threadID,
+		Summary:    observedSummary(content),
+		StartedAt:  queryStartedAt,
+		FinishedAt: queryStartedAt,
+	})
 
 	if initialSquadID == nil {
 		resolved, err := p.RouteQuery(ctx, content)
 		if err != nil {
+			rootSpan.RecordError(err)
+			now := time.Now()
+			_, _ = recordObservedStep(ctx, p.Blackboard, observability.AgentStep{
+				Kind:       observability.StepError,
+				ThreadID:   threadID,
+				Summary:    observedSummary(err.Error()),
+				Error:      err.Error(),
+				StartedAt:  now,
+				FinishedAt: now,
+			})
 			return nil, err
 		}
 		initialSquadID = resolved
@@ -465,6 +525,15 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 
 	defer func() {
 		metrics.Finalize(status)
+		obsRuntime := observedRuntime(p.Blackboard)
+		if obsRuntime.Exporter != nil {
+			if err := obsRuntime.Exporter.Export(ctx, obsRuntime.Ledger.Timeline(threadID)); err != nil {
+				observedLogger(ctx, p.Blackboard).Error("observability export failed",
+					"thread_id", threadID,
+					"error", err,
+				)
+			}
+		}
 		p.mu.Lock()
 		delete(p.completionEvents, threadID)
 		p.activeQueries--
@@ -501,6 +570,14 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 	default:
 		return nil, fmt.Errorf("invalid initial_squad_id type %T", initialSquadID)
 	}
+	routeTime := time.Now()
+	ctx, _ = recordObservedStep(ctx, p.Blackboard, observability.AgentStep{
+		Kind:       observability.StepRouted,
+		ThreadID:   threadID,
+		Summary:    fmt.Sprintf("routed to squads: %s", strings.Join(squadIDs, ", ")),
+		StartedAt:  routeTime,
+		FinishedAt: routeTime,
+	})
 
 	synth := p.FinalSynthesizer
 	if synth != nil {
@@ -527,8 +604,11 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 		_, _ = p.Blackboard.SendMessage(ctx, userMsg)
 	}
 
-	// Immediate quiescence check.
-	if p.isTreeQuiescent(threadID) {
+	// Only short-circuit when there is nothing to dispatch. Routed queries rely
+	// on asynchronous post-insert callbacks, so checking quiescence immediately
+	// after enqueuing the first messages races and can finish the query before
+	// any squad goroutine starts.
+	if len(squadIDs) == 0 && p.isTreeQuiescent(threadID) {
 		if synth == nil || synth.LastSynthesizedContent() != "" {
 			wg.Done()
 		}
@@ -544,6 +624,16 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 	case <-done:
 	case <-time.After(time.Duration(timeout * float64(time.Second))):
 		status = "Timeout"
+		rootSpan.RecordError(fmt.Errorf("execution timed out waiting for squads pipeline to complete"))
+		timeoutTime := time.Now()
+		_, _ = recordObservedStep(ctx, p.Blackboard, observability.AgentStep{
+			Kind:       observability.StepError,
+			ThreadID:   threadID,
+			Summary:    "execution timed out",
+			Error:      "execution timed out waiting for squads pipeline to complete",
+			StartedAt:  timeoutTime,
+			FinishedAt: timeoutTime,
+		})
 		p.mu.Lock()
 		if wg, ok := p.completionEvents[threadID]; ok {
 			wg.Done()
@@ -556,6 +646,16 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 	if exc, ok := p.exceptions[threadID]; ok {
 		p.mu.Unlock()
 		status = "Failed"
+		rootSpan.RecordError(exc)
+		errTime := time.Now()
+		_, _ = recordObservedStep(ctx, p.Blackboard, observability.AgentStep{
+			Kind:       observability.StepError,
+			ThreadID:   threadID,
+			Summary:    observedSummary(exc.Error()),
+			Error:      exc.Error(),
+			StartedAt:  errTime,
+			FinishedAt: errTime,
+		})
 		return nil, exc
 	}
 	p.mu.Unlock()
@@ -566,6 +666,22 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 	if synth != nil {
 		response = synth.LastSynthesizedContent()
 	}
+	completeTime := time.Now()
+	_, _ = recordObservedStep(ctx, p.Blackboard, observability.AgentStep{
+		Kind:       observability.StepQuiesced,
+		ThreadID:   threadID,
+		Summary:    "execution tree reached quiescence",
+		StartedAt:  completeTime,
+		FinishedAt: completeTime,
+	})
+	ctx, _ = recordObservedStep(ctx, p.Blackboard, observability.AgentStep{
+		Kind:       observability.StepResponded,
+		ThreadID:   threadID,
+		Summary:    observedSummary(response),
+		StartedAt:  completeTime,
+		FinishedAt: completeTime,
+	})
+	timeline := observedRuntime(p.Blackboard).Ledger.Timeline(threadID)
 
 	p.mu.Lock()
 	squadThreads := make(map[string]string, len(p.threadToSquadMap))
@@ -579,5 +695,14 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 		History:      history,
 		SquadThreads: squadThreads,
 		Metrics:      metrics.ToDict(),
+		Timeline:     timeline,
+		Metadata: QueryMetadata{
+			CorrelationID:    threadID,
+			ThreadID:         threadID,
+			RespondingSquads: append([]string(nil), squadIDs...),
+			TraceID:          rootStep.TraceID,
+			DurationMS:       time.Since(queryStartedAt).Milliseconds(),
+			TotalSteps:       len(timeline),
+		},
 	}, nil
 }

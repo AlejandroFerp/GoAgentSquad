@@ -1,6 +1,7 @@
 package squads_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/embention/agent-squad-go/pkg/observability"
 	"github.com/embention/agent-squad-go/pkg/squads"
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
@@ -265,5 +267,94 @@ func TestFetchSlicedContext(t *testing.T) {
 	// Should include the synthesis message + 2 post-synthesis messages = 3.
 	if len(sliced) != 3 {
 		t.Errorf("expected 3 messages after synthesis, got %d", len(sliced))
+	}
+}
+
+func TestQueryPropagatesSingleTraceAcrossConcurrentSpans(t *testing.T) {
+	pipeline, bb, _ := setupPipeline(t)
+	tracer := &observability.RecorderTracer{}
+	bb.Observability().Tracer = tracer
+
+	agent1 := squads.NewSubAgent("agent-a", "AgentA", "desc", "system", bb, "squad-1")
+	agent1.LLMCall = mockLLMCall
+	agent1.Model = "mock"
+
+	agent2 := squads.NewSubAgent("agent-b", "AgentB", "desc", "system", bb, "squad-1")
+	agent2.LLMCall = mockLLMCall
+	agent2.Model = "mock"
+
+	squad := squads.NewSquad("squad-1", "Test Squad", "desc", bb)
+	squad.LLMCall = mockLLMCall
+	squad.Model = "mock"
+	squad.RegisterSubAgent(agent1)
+	squad.RegisterSubAgent(agent2)
+	pipeline.RegisterSquad(squad)
+	pipeline.RouteQueryFn = func(ctx context.Context, content string) (any, error) {
+		return "squad-1", nil
+	}
+
+	result, err := pipeline.Query(context.Background(), "trace-thread-1", nil, "help me understand this passage", 5)
+	if err != nil {
+		t.Fatalf("pipeline.Query: %v", err)
+	}
+	if result.Metadata.TraceID == "" {
+		t.Fatal("expected root trace id in query metadata")
+	}
+
+	spans := tracer.Spans()
+	if len(spans) == 0 {
+		t.Fatal("expected recorded spans")
+	}
+	for _, span := range spans {
+		if span.TraceID != result.Metadata.TraceID {
+			t.Fatalf("expected all spans to share trace %q, got %q for span %s", result.Metadata.TraceID, span.TraceID, span.Name)
+		}
+	}
+
+	hasChildSpan := false
+	for _, span := range spans {
+		if span.ParentID != "" {
+			hasChildSpan = true
+			break
+		}
+	}
+	if !hasChildSpan {
+		t.Fatalf("expected at least one child span with a parent id, spans=%+v", spans)
+	}
+
+	if len(result.Timeline) < 4 {
+		t.Fatalf("expected an instrumented timeline, got %d steps", len(result.Timeline))
+	}
+	for _, step := range result.Timeline {
+		if step.TraceID != "" && step.TraceID != result.Metadata.TraceID {
+			t.Fatalf("expected all steps to share trace %q, got %q for step %s", result.Metadata.TraceID, step.TraceID, step.Kind)
+		}
+	}
+}
+
+func TestLoggerFromContextInjectsTraceFields(t *testing.T) {
+	var buffer bytes.Buffer
+	logger := observability.NewTextLogger(&buffer, nil)
+	ctx := observability.WithTraceContext(context.Background(), observability.TraceContext{
+		TraceID:       "trace-123",
+		SpanID:        "span-456",
+		CorrelationID: "corr-789",
+		CausationID:   "cause-000",
+	})
+	ctx = observability.WithStepID(ctx, "step-321")
+
+	observability.BindLogger(logger, ctx).Info("hello logger")
+
+	output := buffer.String()
+	for _, expected := range []string{
+		"trace_id=trace-123",
+		"span_id=span-456",
+		"correlation_id=corr-789",
+		"causation_id=cause-000",
+		"step_id=step-321",
+	} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("expected %q in logger output, got %s", expected, output)
+		}
 	}
 }

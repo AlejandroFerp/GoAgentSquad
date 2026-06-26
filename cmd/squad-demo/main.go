@@ -4,11 +4,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/embention/agent-squad-go/pkg/dashboard"
+	"github.com/embention/agent-squad-go/pkg/observability"
 	"github.com/embention/agent-squad-go/pkg/squads"
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
@@ -96,6 +101,42 @@ func main() {
 	defer svc.Close()
 
 	blackboard := squads.NewSynapseBlackboardBus(svc)
+	otelConfig, otelEnabled, err := observability.OTelRuntimeConfigFromEnv(os.LookupEnv, observability.OTelRuntimeConfig{
+		ServiceName:    "agent-squad-demo",
+		ServiceVersion: "dev",
+		TracerName:     "agent-squad-demo",
+	})
+	if err != nil {
+		log.Fatalf("opentelemetry config: %v", err)
+	}
+	if otelEnabled {
+		otelRuntime, err := observability.NewOTelRuntime(ctx, otelConfig)
+		if err != nil {
+			log.Fatalf("opentelemetry init: %v", err)
+		}
+		blackboard.Observability().Tracer = otelRuntime.Tracer
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if shutdownErr := otelRuntime.Shutdown(shutdownCtx); shutdownErr != nil {
+				log.Printf("opentelemetry shutdown error: %v", shutdownErr)
+			}
+		}()
+		fmt.Printf("OpenTelemetry tracing enabled for service %s\n", otelConfig.ServiceName)
+	}
+	if traceFile := os.Getenv("SQUAD_TRACE_JSONL"); traceFile != "" {
+		blackboard.Observability().Exporter = &observability.JSONFileExporter{Path: traceFile}
+		fmt.Printf("Trace export enabled at %s\n", traceFile)
+	}
+	if addr := os.Getenv("SQUAD_DASHBOARD_ADDR"); addr != "" {
+		server := dashboard.NewServer(blackboard.Observability())
+		go func() {
+			if err := http.ListenAndServe(addr, server); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("dashboard server error: %v", err)
+			}
+		}()
+		fmt.Printf("Dashboard available at http://%s\n", addr)
+	}
 
 	// 2. Create the final synthesizer.
 	finalSynth := NewFinalSynthesizer(blackboard)

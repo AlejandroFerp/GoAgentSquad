@@ -2,10 +2,11 @@ package synapse
 
 import (
 	"context"
-	"log"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/embention/agent-squad-go/pkg/observability"
 )
 
 // SynapseService is the in-memory blackboard engine. It coordinates event
@@ -91,6 +92,20 @@ func (s *SynapseService) SendMessage(ctx context.Context, msg SynapseMessage) (*
 	if current == nil {
 		return nil, nil
 	}
+	if trace, ok := observability.TraceFromContext(ctx); ok {
+		if current.Trace.TraceID == "" {
+			current.Trace.TraceID = trace.TraceID
+		}
+		if current.Trace.SpanID == "" {
+			current.Trace.SpanID = trace.SpanID
+		}
+		if current.Trace.CorrelationID == "" {
+			current.Trace.CorrelationID = trace.CorrelationID
+		}
+	}
+	if stepID, ok := observability.StepIDFromContext(ctx); ok && current.Trace.CausationID == "" {
+		current.Trace.CausationID = stepID
+	}
 
 	s.mu.Lock()
 	s.messageIndex[current.ID] = *current
@@ -106,7 +121,11 @@ func (s *SynapseService) SendMessage(ctx context.Context, msg SynapseMessage) (*
 	s.mu.Unlock()
 
 	if err := s.storage.SaveMessage(ctx, *current); err != nil {
-		log.Printf("synapse: storage save failed: %v", err)
+		observability.LoggerFromContext(ctx).Error("synapse storage save failed",
+			"message_id", current.ID,
+			"thread_id", current.ThreadID,
+			"error", err,
+		)
 	}
 
 	s.Events.EmitPostInsert(ctx, *current)

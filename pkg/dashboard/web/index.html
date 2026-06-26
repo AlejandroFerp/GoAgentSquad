@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Squad Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Agent Squad Dashboard</h1>
+        <p>Live graph, timeline, and metrics for each query execution.</p>
+      </div>
+      <div class="status" id="stream-status">connecting…</div>
+    </header>
+
+    <main class="layout">
+      <aside class="panel queries-panel">
+        <h2>Queries</h2>
+        <div id="queries" class="query-list"></div>
+      </aside>
+
+      <section class="main-panels">
+        <section class="cards" id="metrics"></section>
+
+        <section class="panel graph-panel">
+          <div class="panel-header">
+            <h2>Graph</h2>
+            <span id="selected-query"></span>
+          </div>
+          <svg id="graph" viewBox="0 0 1200 560" preserveAspectRatio="xMidYMid meet"></svg>
+        </section>
+
+        <section class="panel timeline-panel">
+          <h2>Timeline</h2>
+          <div id="timeline" class="timeline"></div>
+        </section>
+      </section>
+
+      <aside class="panel inspector-panel">
+        <h2>Inspector</h2>
+        <pre id="inspector">Select a step or graph node.</pre>
+      </aside>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+  </html>

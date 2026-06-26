@@ -61,11 +61,12 @@ type QuerySummary struct {
 type StepLedger struct {
 	mu   sync.RWMutex
 	byID map[string][]AgentStep
+	seen map[string]struct{}
 	hub  *Hub
 }
 
 func NewStepLedger(hub *Hub) *StepLedger {
-	return &StepLedger{byID: make(map[string][]AgentStep), hub: hub}
+	return &StepLedger{byID: make(map[string][]AgentStep), seen: make(map[string]struct{}), hub: hub}
 }
 
 func (l *StepLedger) Record(step AgentStep) AgentStep {
@@ -83,6 +84,14 @@ func (l *StepLedger) Record(step AgentStep) AgentStep {
 	if l.byID == nil {
 		l.byID = make(map[string][]AgentStep)
 	}
+	if l.seen == nil {
+		l.seen = make(map[string]struct{})
+	}
+	if _, exists := l.seen[step.StepID]; exists {
+		l.mu.Unlock()
+		return step
+	}
+	l.seen[step.StepID] = struct{}{}
 	l.byID[step.CorrelationID] = append(l.byID[step.CorrelationID], step)
 	hub := l.hub
 	l.mu.Unlock()
