@@ -115,6 +115,109 @@ The dashboard exposes observability data for humans.
 9. The final synthesizer produces the response.
 10. Metrics, timeline steps, logs, JSONL traces, dashboard data, and optional OTel spans are available for inspection.
 
+## Integration Guide
+
+An application integrates the framework by assembling four layers:
+
+1. Create a `SynapseService` and wrap it with `NewSynapseBlackboardBus`.
+2. Create a `SquadsPipeline` with a final synthesizer.
+3. Register squads, subagents, transversal agents, and observers.
+4. Call `Query` with a thread ID, a route (or a `RouteQueryFn`), the user content, and a timeout.
+
+The minimum application-owned contracts are:
+
+- `squads.LLMCall`: receives `context.Context`, model name, system prompt, and chat messages. It returns a map containing at least `content`; token fields (`prompt_tokens`, `completion_tokens`, and `total_tokens`) are optional and used for metrics when present.
+- `squads.FinalSynthesizer`: receives the completed execution context through the application implementation and exposes the final response through `LastSynthesizedContent`.
+- `squads.TransversalAgent.ExecuteTask`: receives a `SynapseMessage` and returns the delegated task result.
+- `squads.LocalTool.Func`: receives a `map[string]any` of arguments and returns a result or error.
+
+The demo in `cmd/squad-demo/main.go` is the canonical wiring example. Its `mockLLMCall` can be replaced with an adapter for the application's model provider without changing the pipeline, Synapse, or dashboard packages.
+
+### Component Registration Order
+
+Registration can happen before the first query. The pipeline starts all registered observers, transversals, and squads when the first query arrives, and stops them after the last active query finishes.
+
+```go
+service := synapse.NewSynapseService(50, nil)
+if err := service.Connect(ctx); err != nil {
+		return err
+}
+defer service.Close()
+
+blackboard := squads.NewSynapseBlackboardBus(service)
+pipeline := squads.NewSquadsPipeline(blackboard, synthesizer, 15)
+
+agent := squads.NewSubAgent(
+		"research-agent", "ResearchAgent", "Researches the requested topic.",
+		"Answer using the available context and tools.", blackboard, "research",
+)
+agent.Model = "application-model"
+agent.LLMCall = llmCall
+
+researchSquad := squads.NewSquad(
+		"research", "Research Squad", "Coordinates research agents.", blackboard,
+)
+researchSquad.RegisterSubAgent(agent)
+researchSquad.LLMCall = llmCall
+pipeline.RegisterSquad(researchSquad)
+
+pipeline.RouteQueryFn = func(ctx context.Context, content string) (any, error) {
+		return "research", nil
+}
+
+result, err := pipeline.Query(ctx, "conversation-01", nil, userQuery, 10)
+```
+
+`initialSquadID` may be a single squad ID or a collection of IDs. When it is `nil`, `Query` calls `RouteQueryFn`; a missing route function is an application configuration error. If `threadID` is empty, the pipeline generates one. A non-positive timeout uses the default of 10 seconds, and a non-positive `maxIterations` uses the default of 15.
+
+### Agent Reasoning And Tools
+
+Each `SubAgent` runs its reasoning loop after its squad receives a matching blackboard message:
+
+1. The agent fetches the current thread context and builds the LLM message payload.
+2. Registered local and cross-agent tools are appended to the system prompt.
+3. A normal LLM response is posted as an assistant context message.
+4. A tool response must be a JSON object with the following shape:
+
+```json
+{
+	"call_tool": "tool_name",
+	"arguments": {
+		"parameter": "value"
+	}
+}
+```
+
+5. Local tools execute in-process. Failed local tools can be retried up to `ToolMaxRetry`; the agent asks the LLM for corrected arguments between attempts.
+6. Cross-agent tools create a `TaskMessage` on a child thread. The eventual reply is correlated with the originating agent and resumes its execution.
+
+Local tools are registered in `SubAgent.PythonToolsMap` for compatibility with the source framework's naming. Each entry must include a `ToolSchema` and a `LocalTool.Func`. Cross-agent tools are populated automatically by `UpdateGlobalTopology`, unless excluded through `ExcludedSquads`, `ExcludedTransversals`, or `ExcludedTasks`.
+
+### Synapse Message Model
+
+Synapse is an in-memory blackboard with an optional `BaseStorage` implementation. Every message has an ID, thread, agent, role, TTL, message class, payload, and trace metadata.
+
+| Message | Purpose | Main payload fields |
+| --- | --- | --- |
+| `ContextMessage` | User, assistant, system, or tool conversation context | `content`, `citations` |
+| `TaskMessage` | Delegates work to a squad or transversal | `task_type`, `parameters`, `reply_to_thread` |
+| `CommandMessage` | Control-plane directive | `command`, `parameters` |
+
+`TaskMessage` is single-consumer by default (`MaxConsumers = 1`). Consumption is atomic, so concurrent workers cannot process the same task beyond its configured consumer limit. Messages expire according to TTL and are removed by the service garbage collector. `NoopStorage` is the default and keeps state in memory; use a `BaseStorage` implementation when persistence is required.
+
+### Query Result And Traceability
+
+`Query` returns a `QueryResult` containing:
+
+- `Response`: the final synthesizer output.
+- `History`: messages fetched from the root thread.
+- `SquadThreads`: the root and currently associated squad threads.
+- `Metrics`: execution, agent, LLM, delegation, transversal, observer, and error metrics.
+- `Timeline`: ordered `AgentStep` records for the correlation ID.
+- `Metadata`: correlation/thread IDs, responding squads, trace ID, duration, and step count.
+
+The query thread ID is also the default correlation ID. Child threads are linked through `ParentThreadMap`, and trace context is copied into persisted Synapse messages. This allows asynchronous event handlers, dashboard projections, logs, and exporters to refer to the same execution tree.
+
 ## Loop And Completion Safety
 
 - The dashboard graph is observational only; it does not control execution depth.
@@ -198,6 +301,10 @@ The standalone dashboard tails the JSONL file incrementally and deduplicates ste
 - `GET /api/metrics/summary?query={correlation_id}`: returns aggregate duration, token, LLM/tool, agent, and error metrics.
 - `GET /api/stream`: opens an SSE stream of live `AgentStep` events.
 
+The dashboard is read-only: it projects the observability ledger and does not dispatch agents or change execution depth. The embedded mode shares the runtime with the demo process and therefore shows live events immediately. The standalone mode creates its own runtime; it only displays live data when another component writes to that same runtime, or persisted data when `--trace-file` is supplied.
+
+The JSONL loader tracks its byte offset, ignores malformed lines so replay can continue, resets after file truncation/rotation, and deduplicates steps by `step_id` in the ledger. This makes the standalone dashboard suitable for tailing a file that is still being appended to.
+
 ## OpenTelemetry
 
 OpenTelemetry is optional. The project pins OTel to the Go 1.22-compatible `v1.35.0` line. Newer OTel versions may raise the module Go baseline.
@@ -218,3 +325,7 @@ go test ./tests/squads
 go test ./tests/observability
 go test ./tests/dashboard
 ```
+
+The tests are organized by responsibility: `tests/synapse` covers message lifecycle, event dispatch, atomic task consumption, caching, and garbage collection; `tests/squads` covers routing, agent execution, delegation, metrics, and trace propagation; `tests/observability` covers local tracing, logging, and OTLP configuration; and `tests/dashboard` covers projections, REST, SSE, and JSONL replay.
+
+Run commands from the directory containing `go.mod` (`GoAgentSquad`). The module currently declares Go `1.25.0` and pins OpenTelemetry to `v1.35.0`.
