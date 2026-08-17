@@ -35,6 +35,8 @@ type Span interface {
 // OTelTracer adapts an OpenTelemetry tracer to the local observability contract.
 type OTelTracer struct{ tr oteltrace.Tracer }
 
+var _ Tracer = OTelTracer{}
+
 // NewOTelTracer wraps an OTel tracer with the local Tracer interface.
 func NewOTelTracer(tracer oteltrace.Tracer) OTelTracer {
 	return OTelTracer{tr: tracer}
@@ -51,6 +53,8 @@ func (t OTelTracer) StartSpan(ctx context.Context, name string, attrs ...Attr) (
 
 // NoopTracer is the safe default when no exporter is configured.
 type NoopTracer struct{}
+
+var _ Tracer = NoopTracer{}
 
 func (NoopTracer) StartSpan(ctx context.Context, _ string, _ ...Attr) (context.Context, Span) {
 	trace, ok := TraceFromContext(ctx)
@@ -71,9 +75,13 @@ type noopSpan struct {
 	startedAt time.Time
 }
 
+var _ Span = (*noopSpan)(nil)
+
 type otelSpan struct {
 	span oteltrace.Span
 }
+
+var _ Span = (*otelSpan)(nil)
 
 func (s *noopSpan) SetAttributes(_ ...Attr) {}
 func (s *noopSpan) RecordError(_ error)     {}
@@ -135,6 +143,8 @@ type RecorderTracer struct {
 	spans []RecordedSpan
 }
 
+var _ Tracer = (*RecorderTracer)(nil)
+
 func (t *RecorderTracer) StartSpan(ctx context.Context, name string, attrs ...Attr) (context.Context, Span) {
 	trace, ok := TraceFromContext(ctx)
 	if !ok || trace.TraceID == "" {
@@ -172,6 +182,8 @@ type recorderSpan struct {
 	recorded RecordedSpan
 	once     sync.Once
 }
+
+var _ Span = (*recorderSpan)(nil)
 
 func (s *recorderSpan) SetAttributes(attrs ...Attr) {
 	s.recorded.Attrs = append(s.recorded.Attrs, attrs...)

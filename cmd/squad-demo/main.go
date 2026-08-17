@@ -34,6 +34,8 @@ type FinalSynthesizerImpl struct {
 	LastContent string
 }
 
+var _ squads.FinalSynthesizer = (*FinalSynthesizerImpl)(nil)
+
 // NewFinalSynthesizer builds a FinalSynthesizerImpl.
 func NewFinalSynthesizer(bb squads.BlackboardBus) *FinalSynthesizerImpl {
 	return &FinalSynthesizerImpl{Blackboard: bb}

@@ -31,18 +31,23 @@ type GraphEdge struct {
 }
 
 type MetricsSummary struct {
-	CorrelationID  string `json:"correlation_id"`
-	DurationMS     int64  `json:"duration_ms"`
-	TotalSteps     int    `json:"total_steps"`
-	TotalTokensIn  int    `json:"total_tokens_in"`
-	TotalTokensOut int    `json:"total_tokens_out"`
-	LLMCalls       int    `json:"llm_calls"`
-	ToolCalls      int    `json:"tool_calls"`
-	UniqueAgents   int    `json:"unique_agents"`
-	Errors         int    `json:"errors"`
-	SSEDropped     int    `json:"sse_dropped_events"`
-	SSESubscribers int    `json:"sse_subscribers"`
-	SSEMaxClients  int    `json:"sse_max_clients"`
+	CorrelationID  string  `json:"correlation_id"`
+	DurationMS     int64   `json:"duration_ms"`
+	TotalSteps     int     `json:"total_steps"`
+	TotalTokensIn  int     `json:"total_tokens_in"`
+	TotalTokensOut int     `json:"total_tokens_out"`
+	TotalTokens    int     `json:"total_tokens"`
+	TotalCostUSD   float64 `json:"total_cost_usd"`
+	MaxTotalTokens int     `json:"max_total_tokens"`
+	MaxCostUSD     float64 `json:"max_cost_usd"`
+	BudgetStatus   string  `json:"budget_status"`
+	LLMCalls       int     `json:"llm_calls"`
+	ToolCalls      int     `json:"tool_calls"`
+	UniqueAgents   int     `json:"unique_agents"`
+	Errors         int     `json:"errors"`
+	SSEDropped     int     `json:"sse_dropped_events"`
+	SSESubscribers int     `json:"sse_subscribers"`
+	SSEMaxClients  int     `json:"sse_max_clients"`
 }
 
 type QuerySnapshot struct {

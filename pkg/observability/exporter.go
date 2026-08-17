@@ -21,6 +21,8 @@ type StdoutExporter struct {
 	Writer io.Writer
 }
 
+var _ TraceExporter = StdoutExporter{}
+
 func (e StdoutExporter) Export(_ context.Context, steps []AgentStep) error {
 	writer := e.Writer
 	if writer == nil {
@@ -42,6 +44,8 @@ type JSONFileExporter struct {
 	mu   sync.Mutex
 	Path string
 }
+
+var _ TraceExporter = (*JSONFileExporter)(nil)
 
 func (e *JSONFileExporter) Export(_ context.Context, steps []AgentStep) error {
 	if e.Path == "" {

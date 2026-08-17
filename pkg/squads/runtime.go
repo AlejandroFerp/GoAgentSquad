@@ -17,6 +17,7 @@ type AgentDefinition struct {
 	Type                 string
 	Description          string
 	SystemPrompt         string
+	Tools                map[string]LocalTool
 	Model                string
 	LLMCall              LLMCall
 	ExcludedSquads       []string
@@ -41,6 +42,7 @@ type RuntimeConfig struct {
 	Model             string
 	LLMCall           LLMCall
 	CaptureLLMContent bool
+	ExecutionBudget   ExecutionBudget
 	FinalSynthesizer  FinalSynthesizer
 	RouteQueryFn      func(ctx context.Context, content string) ([]string, error)
 	Squads            []SquadDefinition
@@ -55,6 +57,9 @@ type Runtime struct {
 
 // NewRuntime creates a connected runtime and registers every declared squad and agent.
 func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
+	if err := cfg.ExecutionBudget.Validate(); err != nil {
+		return nil, fmt.Errorf("validate runtime execution budget: %w", err)
+	}
 	if len(cfg.Squads) == 0 {
 		return nil, fmt.Errorf("runtime requires at least one squad")
 	}
@@ -71,6 +76,10 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	blackboard := NewSynapseBlackboardBus(service)
 	blackboard.Observability().CaptureLLMContent = cfg.CaptureLLMContent
 	pipeline := NewSquadsPipeline(blackboard, cfg.FinalSynthesizer, cfg.MaxIterations)
+	if err := pipeline.SetExecutionBudget(cfg.ExecutionBudget); err != nil {
+		_ = service.Close()
+		return nil, fmt.Errorf("configure execution budget: %w", err)
+	}
 	pipeline.RouteQueryFn = cfg.RouteQueryFn
 	runtime := &Runtime{service: service, blackboard: blackboard, pipeline: pipeline}
 	if err := runtime.registerSquads(cfg); err != nil {
@@ -135,6 +144,9 @@ func (r *Runtime) registerSquads(cfg RuntimeConfig) error {
 			agent.LLMCall = firstLLMCall(agentDefinition.LLMCall, squad.LLMCall)
 			if agent.LLMCall == nil {
 				return fmt.Errorf("runtime agent %q requires an LLM call", agentDefinition.ID)
+			}
+			for toolName, tool := range agentDefinition.Tools {
+				agent.PythonToolsMap[toolName] = tool
 			}
 			agent.ExcludedSquads = append([]string(nil), agentDefinition.ExcludedSquads...)
 			agent.ExcludedTasks = append([]string(nil), agentDefinition.ExcludedTasks...)

@@ -436,6 +436,221 @@ func TestDashboardMetricsExposeSSEDropsAndSubscriberCapacity(t *testing.T) {
 	}
 }
 
+func TestDashboardMetricsExposeCostAndExecutionBudgetWithoutLLMTrace(t *testing.T) {
+	obs := newObservedRuntime()
+	budget := &observability.ExecutionBudgetSnapshot{
+		UsageSequence:    1,
+		PromptTokens:     12,
+		CompletionTokens: 8,
+		TotalTokens:      20,
+		CostUSD:          0.0042,
+		MaxTotalTokens:   50,
+		MaxCostUSD:       0.01,
+		Status:           "available",
+	}
+	obs.Ledger.Record(observability.AgentStep{
+		CorrelationID: "budget-query",
+		Kind:          observability.StepLLMCall,
+		ThreadID:      "budget-query",
+		AgentID:       "budget-agent",
+		TokensIn:      12,
+		TokensOut:     8,
+		CostUSD:       0.0042,
+		Budget:        budget,
+		StartedAt:     time.Now(),
+		FinishedAt:    time.Now(),
+	})
+
+	metrics := dashboard.BuildMetricsSummary("budget-query", obs.Ledger.Timeline("budget-query"))
+	if metrics.TotalCostUSD != 0.0042 || metrics.TotalTokens != 20 || metrics.MaxTotalTokens != 50 || metrics.MaxCostUSD != 0.01 || metrics.BudgetStatus != "available" {
+		t.Fatalf("metrics = %+v, want cost and budget values from the top-level AgentStep snapshot", metrics)
+	}
+
+	server := httptest.NewServer(dashboard.NewServer(obs))
+	defer server.Close()
+	response, err := http.Get(server.URL + "/api/metrics/summary?query=budget-query")
+	if err != nil {
+		t.Fatalf("GET budget metrics: %v", err)
+	}
+	defer response.Body.Close()
+	var apiMetrics dashboard.MetricsSummary
+	if err := json.NewDecoder(response.Body).Decode(&apiMetrics); err != nil {
+		t.Fatalf("decode budget metrics: %v", err)
+	}
+	if apiMetrics.TotalCostUSD != metrics.TotalCostUSD || apiMetrics.MaxTotalTokens != metrics.MaxTotalTokens || apiMetrics.BudgetStatus != metrics.BudgetStatus {
+		t.Fatalf("API metrics = %+v, want %+v", apiMetrics, metrics)
+	}
+}
+
+func TestDashboardMetricsSelectLatestBudgetSnapshotByUsageSequence(t *testing.T) {
+	obs := newObservedRuntime()
+	latestBudget := &observability.ExecutionBudgetSnapshot{
+		UsageSequence:    2,
+		PromptTokens:     10,
+		CompletionTokens: 10,
+		TotalTokens:      20,
+		CostUSD:          0.02,
+		MaxTotalTokens:   15,
+		MaxCostUSD:       0.01,
+		Status:           "exceeded",
+	}
+	staleBudget := &observability.ExecutionBudgetSnapshot{
+		UsageSequence:    1,
+		PromptTokens:     5,
+		CompletionTokens: 5,
+		TotalTokens:      10,
+		CostUSD:          0.01,
+		MaxTotalTokens:   15,
+		MaxCostUSD:       0.01,
+		Status:           "available",
+	}
+	// Append the newer accounting snapshot first to simulate a concurrent call
+	// whose earlier timeline event is recorded after a later one.
+	obs.Ledger.Record(observability.AgentStep{
+		CorrelationID: "out-of-order-budget-query",
+		Kind:          observability.StepLLMCall,
+		ThreadID:      "out-of-order-budget-query",
+		TokensIn:      5,
+		TokensOut:     5,
+		CostUSD:       0.01,
+		Budget:        latestBudget,
+		StartedAt:     time.Now(),
+		FinishedAt:    time.Now(),
+	})
+	obs.Ledger.Record(observability.AgentStep{
+		CorrelationID: "out-of-order-budget-query",
+		Kind:          observability.StepLLMCall,
+		ThreadID:      "out-of-order-budget-query",
+		TokensIn:      5,
+		TokensOut:     5,
+		CostUSD:       0.01,
+		Budget:        staleBudget,
+		StartedAt:     time.Now(),
+		FinishedAt:    time.Now(),
+	})
+
+	metrics := dashboard.BuildMetricsSummary("out-of-order-budget-query", obs.Ledger.Timeline("out-of-order-budget-query"))
+	if metrics.TotalTokens != latestBudget.TotalTokens || metrics.TotalCostUSD != latestBudget.CostUSD || metrics.BudgetStatus != latestBudget.Status {
+		t.Fatalf("metrics = %+v, want the highest usage sequence snapshot %+v", metrics, latestBudget)
+	}
+}
+
+func TestDashboardBudgetRejectionDoesNotCountAsProviderCall(t *testing.T) {
+	obs := newObservedRuntime()
+	budget := &observability.ExecutionBudgetSnapshot{
+		UsageSequence:  2,
+		TotalTokens:    10,
+		MaxTotalTokens: 10,
+		Status:         "exhausted",
+	}
+	obs.Ledger.Record(observability.AgentStep{
+		CorrelationID: "budget-rejection-query",
+		Kind:          observability.StepLLMCall,
+		ThreadID:      "budget-rejection-query",
+		TokensIn:      6,
+		TokensOut:     4,
+		Budget:        budget,
+		StartedAt:     time.Now(),
+		FinishedAt:    time.Now(),
+	})
+	obs.Ledger.Record(observability.AgentStep{
+		CorrelationID: "budget-rejection-query",
+		Kind:          observability.StepError,
+		ThreadID:      "budget-rejection-query",
+		Summary:       "LLM call blocked by execution budget",
+		Error:         "execution budget exhausted",
+		Budget:        budget,
+		StartedAt:     time.Now(),
+		FinishedAt:    time.Now(),
+	})
+
+	metrics := dashboard.BuildMetricsSummary("budget-rejection-query", obs.Ledger.Timeline("budget-rejection-query"))
+	if metrics.LLMCalls != 1 || metrics.Errors != 1 || metrics.BudgetStatus != "exhausted" {
+		t.Fatalf("metrics = %+v, want one provider call, one budget error, and exhausted status", metrics)
+	}
+}
+
+func TestDashboardWorkflowMetricsAggregateExecutionBudgets(t *testing.T) {
+	obs := newObservedRuntime()
+	startedAt := time.Now()
+	for _, execution := range []struct {
+		correlationID string
+		promptTokens  int
+		completion    int
+		totalTokens   int
+		costUSD       float64
+		maxTokens     int
+		maxCostUSD    float64
+		status        string
+	}{
+		{
+			correlationID: "workflow-budget-a",
+			promptTokens:  6,
+			completion:    4,
+			totalTokens:   10,
+			costUSD:       0.001,
+			maxTokens:     20,
+			maxCostUSD:    0.01,
+			status:        "available",
+		},
+		{
+			correlationID: "workflow-budget-b",
+			promptTokens:  10,
+			completion:    5,
+			totalTokens:   15,
+			costUSD:       0.002,
+			maxTokens:     30,
+			maxCostUSD:    0.02,
+			status:        "exhausted",
+		},
+	} {
+		obs.Ledger.Record(observability.AgentStep{
+			CorrelationID: execution.correlationID,
+			Kind:          observability.StepLLMCall,
+			ThreadID:      execution.correlationID,
+			TokensIn:      execution.promptTokens,
+			TokensOut:     execution.completion,
+			CostUSD:       execution.costUSD,
+			Budget: &observability.ExecutionBudgetSnapshot{
+				UsageSequence:    1,
+				PromptTokens:     execution.promptTokens,
+				CompletionTokens: execution.completion,
+				TotalTokens:      execution.totalTokens,
+				CostUSD:          execution.costUSD,
+				MaxTotalTokens:   execution.maxTokens,
+				MaxCostUSD:       execution.maxCostUSD,
+				Status:           execution.status,
+			},
+			StartedAt:  startedAt,
+			FinishedAt: startedAt,
+		})
+	}
+
+	timeline := append(
+		obs.Ledger.Timeline("workflow-budget-a"),
+		obs.Ledger.Timeline("workflow-budget-b")...,
+	)
+	metrics := dashboard.BuildMetricsSummary(dashboard.WorkflowCorrelationID, timeline)
+	if metrics.TotalTokens != 25 || metrics.MaxTotalTokens != 50 || metrics.TotalCostUSD != 0.003 || metrics.MaxCostUSD != 0.03 || metrics.BudgetStatus != "exhausted" {
+		t.Fatalf("workflow metrics = %+v, want aggregate execution budgets", metrics)
+	}
+
+	server := httptest.NewServer(dashboard.NewServer(obs))
+	defer server.Close()
+	response, err := http.Get(server.URL + "/api/workflow/metrics")
+	if err != nil {
+		t.Fatalf("GET workflow metrics: %v", err)
+	}
+	defer response.Body.Close()
+	var apiMetrics dashboard.MetricsSummary
+	if err := json.NewDecoder(response.Body).Decode(&apiMetrics); err != nil {
+		t.Fatalf("decode workflow metrics: %v", err)
+	}
+	if apiMetrics.TotalTokens != metrics.TotalTokens || apiMetrics.MaxTotalTokens != metrics.MaxTotalTokens || apiMetrics.TotalCostUSD != metrics.TotalCostUSD || apiMetrics.MaxCostUSD != metrics.MaxCostUSD || apiMetrics.BudgetStatus != metrics.BudgetStatus {
+		t.Fatalf("workflow API metrics = %+v, want %+v", apiMetrics, metrics)
+	}
+}
+
 func TestDashboardStream(t *testing.T) {
 	obs := newObservedRuntime()
 	server := httptest.NewServer(dashboard.NewServer(obs))
@@ -483,6 +698,57 @@ func TestDashboardStream(t *testing.T) {
 		}
 	}
 	t.Fatal("timed out waiting for SSE payload")
+}
+
+func TestDashboardStreamUsesAgentErrorEventName(t *testing.T) {
+	obs := newObservedRuntime()
+	server := httptest.NewServer(dashboard.NewServer(obs))
+	defer server.Close()
+
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL+"/api/stream", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("stream request: %v", err)
+	}
+	defer response.Body.Close()
+
+	obs.Ledger.Record(observability.AgentStep{
+		CorrelationID: "thread-error-stream",
+		TraceID:       "trace-error-stream",
+		SpanID:        "span-error-stream",
+		Kind:          observability.StepError,
+		ThreadID:      "thread-error-stream",
+		Summary:       "agent request failed",
+		Error:         "agent request failed",
+		StartedAt:     time.Now(),
+	})
+
+	reader := bufio.NewReader(response.Body)
+	deadline := time.Now().Add(2 * time.Second)
+	seenEvent := false
+	seenPayload := false
+	for time.Now().Before(deadline) && (!seenEvent || !seenPayload) {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			t.Fatalf("read error event stream: %v", readErr)
+		}
+		line = strings.TrimSpace(line)
+		if line == "event: agent_error" {
+			seenEvent = true
+		}
+		if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"kind":"error"`) {
+			seenPayload = true
+		}
+	}
+	if !seenEvent {
+		t.Fatal("error step was emitted with the transport-reserved event name")
+	}
+	if !seenPayload {
+		t.Fatal("error step payload did not preserve its observability kind")
+	}
 }
 
 func TestDashboardLoadsTraceFileWithoutDuplicatingSteps(t *testing.T) {

@@ -537,6 +537,9 @@ func (s *Squad) DoCoordination(ctx context.Context, squadThreadID, parentThreadI
 				"model", model,
 				"error", err,
 			)
+			if errors.Is(err, ErrExecutionBudgetExceeded) {
+				return fmt.Errorf("coordinate squad %q: %w", s.SquadID, err)
+			}
 		} else if res.Content != "" {
 			summary = strings.TrimSpace(res.Content)
 		}
@@ -560,43 +563,24 @@ func (s *Squad) DoCoordination(ctx context.Context, squadThreadID, parentThreadI
 }
 
 func (s *Squad) callCoordinatorLLMObserved(ctx context.Context, threadID, systemPrompt string) (LLMResponse, error) {
-	if s.LLMCall == nil {
-		return LLMResponse{}, nil
-	}
 	coordinatorID := s.SquadID + "-coordinator"
-	llmCtx, span := startObservedSpan(ctx, s.Blackboard, "squad.coordinator.llm",
-		observability.Attr{Key: observability.AttrAgentID, Value: coordinatorID},
-		observability.Attr{Key: observability.AttrAgentType, Value: "COORDINATOR"},
-		observability.Attr{Key: observability.AttrSquadID, Value: s.SquadID},
-		observability.Attr{Key: observability.AttrThreadID, Value: threadID},
-		observability.Attr{Key: observability.AttrModel, Value: s.Model},
+	return invokeObservedLLMCall(
+		ctx,
+		s.Blackboard,
+		s.LLMCall,
+		observedLLMCall{
+			SpanName:     "squad.coordinator.llm",
+			AgentID:      coordinatorID,
+			AgentType:    "COORDINATOR",
+			SquadID:      s.SquadID,
+			ThreadID:     threadID,
+			Model:        s.Model,
+			Summary:      "squad coordinator llm call",
+			SystemPrompt: systemPrompt,
+			Clock:        time.Now,
+		},
+		func(metrics PipelineMetrics, response LLMResponse, elapsed time.Duration) (observability.ExecutionBudgetSnapshot, bool, error) {
+			return recordBudgetedCoordinatorLLMUsage(metrics, s.SquadID, response, elapsed)
+		},
 	)
-	startedAt := time.Now()
-	res, err := s.LLMCall(llmCtx, s.Model, systemPrompt, nil)
-	finishedAt := time.Now()
-	metrics := s.Blackboard.GetMetrics(threadID)
-	if metrics != nil {
-		metrics.RecordCoordinatorUsage(s.SquadID, res.PromptTokens, res.CompletionTokens, res.TotalTokens, finishedAt.Sub(startedAt))
-	}
-	step := observability.AgentStep{
-		Kind:       observability.StepLLMCall,
-		AgentID:    coordinatorID,
-		AgentType:  "COORDINATOR",
-		SquadID:    s.SquadID,
-		ThreadID:   threadID,
-		Summary:    "squad coordinator llm call",
-		Model:      s.Model,
-		TokensIn:   res.PromptTokens,
-		TokensOut:  res.CompletionTokens,
-		StartedAt:  startedAt,
-		FinishedAt: finishedAt,
-		LLMTrace:   captureLLMTrace(s.Blackboard, systemPrompt, nil, res),
-	}
-	if err != nil {
-		span.RecordError(err)
-		step.Error = err.Error()
-	}
-	_, _ = recordObservedStep(llmCtx, s.Blackboard, step)
-	span.End()
-	return res, err
 }

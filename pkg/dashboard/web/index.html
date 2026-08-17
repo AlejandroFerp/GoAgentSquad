@@ -43,17 +43,26 @@
       <section class="main-panels">
         <section class="cards" id="metrics"></section>
 
-        <section class="panel graph-panel">
+        <section class="panel graph-panel" id="graph-panel">
           <div class="panel-header">
             <div>
               <h2>Execution graph</h2>
               <span class="selected-query" id="selected-query"></span>
             </div>
             <div class="graph-controls" aria-label="Graph navigation">
+              <div class="graph-view-tabs" role="tablist" aria-label="Diagram view">
+                <button class="graph-view-tab active" id="sequence-view" type="button" role="tab" aria-selected="true">Sequence</button>
+                <button class="graph-view-tab" id="state-view" type="button" role="tab" aria-selected="false">State</button>
+                <button class="graph-view-tab" id="mindmap-view" type="button" role="tab" aria-selected="false">Mindmap</button>
+                <button class="graph-view-tab" id="flow-view" type="button" role="tab" aria-selected="false">Flow</button>
+              </div>
               <button class="icon-button" id="zoom-out" type="button" data-tooltip="Zoom out" aria-label="Zoom out">−</button>
               <output id="zoom-level" aria-live="polite">100%</output>
+                <input class="zoom-slider" id="zoom-slider" type="range" min="25" max="300" step="5" value="100" aria-label="Diagram zoom" data-tooltip="Adjust diagram zoom" />
               <button class="icon-button" id="zoom-in" type="button" data-tooltip="Zoom in" aria-label="Zoom in">+</button>
               <button class="fit-button" id="zoom-fit" type="button" data-tooltip="Reset zoom and scroll position">Fit</button>
+              <button class="icon-button" id="graph-download" type="button" data-tooltip="Download current diagram as PNG" aria-label="Download current diagram as PNG"><span aria-hidden="true">&#x2913;</span></button>
+              <button class="icon-button graph-fullscreen" id="graph-fullscreen" type="button" data-tooltip="Open graph fullscreen" aria-label="Open graph fullscreen"><span aria-hidden="true">&#x26F6;</span></button>
             </div>
           </div>
           <div class="graph-legend" aria-label="Graph status legend">
@@ -61,7 +70,7 @@
             <span><i class="legend-dot running"></i>Running</span>
             <span><i class="legend-dot done"></i>Done</span>
             <span><i class="legend-dot error"></i>Error</span>
-            <span class="pan-hint">Scroll to navigate</span>
+            <span class="pan-hint">Drag to pan · Wheel to zoom</span>
           </div>
           <div class="graph-flow-legend" aria-label="Graph flow legend">
             <span><i class="legend-line route"></i>Route: phase sends work to a squad</span>
@@ -70,17 +79,14 @@
             <span><i class="legend-line summary"></i>Summary: coordinator returns output to the phase</span>
             <span><i class="legend-line completion"></i>Completion: final root event closes the workflow</span>
           </div>
-          <div class="graph-shape-legend" aria-label="Graph role legend">
-            <span><i class="legend-shape phase"></i>Workflow or phase</span>
-            <span><i class="legend-shape squad"></i>Squad</span>
-            <span><i class="legend-shape coordinator"></i>Coordinator</span>
-            <span><i class="legend-shape agent"></i>Field agent</span>
-            <span><i class="legend-shape tool"></i>Tool or task</span>
-            <span><i class="legend-shape terminal"></i>Workflow completion</span>
+          <div class="graph-shape-legend" aria-label="Diagram legend">
+            <span><i class="legend-sequence-lifeline"></i>Participant lifeline</span>
+            <span><i class="legend-sequence-message"></i>State/message transition</span>
+            <span><i class="legend-sequence-number">1</i>Chronological event</span>
           </div>
-          <div class="graph-viewport" id="graph-viewport" tabindex="0" aria-label="Execution graph. Scroll to navigate and select a node for details.">
+          <div class="graph-viewport" id="graph-viewport" tabindex="0" aria-label="Execution graph. Drag to pan, use the mouse wheel to zoom, and select a node for details.">
             <p class="empty-state" id="graph-empty">Select a query to view its execution graph.</p>
-            <svg id="graph" viewBox="0 0 1200 560" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Selected query execution graph"></svg>
+            <div id="graph" class="sequence-diagram" role="img" aria-label="Selected query execution sequence"></div>
           </div>
           <div class="graph-edge-tooltip" id="graph-edge-tooltip" role="tooltip" hidden></div>
         </section>
@@ -133,6 +139,8 @@
       </section>
     </aside>
 
+    <!-- Vendored so the dashboard renders graphs offline from the embedded binary. -->
+    <script src="/mermaid.min.js"></script>
     <script src="/app.js"></script>
   </body>
   </html>

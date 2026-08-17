@@ -24,6 +24,8 @@ type Synthesizer struct {
 	subscription synapse.SubscriptionID
 }
 
+var _ ObserverStarter = (*Synthesizer)(nil)
+
 // NewSynthesizer builds a Synthesizer with a default summarizer.
 func NewSynthesizer(bb BlackboardBus, threshold int, summarize func([]synapse.SynapseMessage) string) *Synthesizer {
 	if threshold <= 0 {

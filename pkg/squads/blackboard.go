@@ -173,19 +173,25 @@ func (p *ParentThreadMap) DeleteTree(rootThread string) []string {
 // contract. It also carries the auxiliary state that squads attach to the
 // blackboard at runtime (metrics registry and parent thread map).
 type SynapseBlackboardBus struct {
-	synapse      *synapse.SynapseService
-	metricsStore *BoundedMap
-	parents      *ParentThreadMap
-	obs          *ObservabilityRuntime
+	synapse               *synapse.SynapseService
+	metricsStore          *BoundedMap
+	activeMetricsMu       sync.RWMutex
+	activeMetricsByRootID map[string]PipelineMetrics
+	parents               *ParentThreadMap
+	obs                   *ObservabilityRuntime
 }
+
+var _ BlackboardBus = (*SynapseBlackboardBus)(nil)
+var _ executionMetricsRegistry = (*SynapseBlackboardBus)(nil)
 
 // NewSynapseBlackboardBus wraps a SynapseService into a BlackboardBus.
 func NewSynapseBlackboardBus(svc *synapse.SynapseService) *SynapseBlackboardBus {
 	return &SynapseBlackboardBus{
-		synapse:      svc,
-		metricsStore: NewBoundedMap(100),
-		parents:      NewParentThreadMap(),
-		obs:          NewObservabilityRuntime(),
+		synapse:               svc,
+		metricsStore:          NewBoundedMap(100),
+		activeMetricsByRootID: make(map[string]PipelineMetrics),
+		parents:               NewParentThreadMap(),
+		obs:                   NewObservabilityRuntime(),
 	}
 }
 
@@ -208,11 +214,47 @@ func (b *SynapseBlackboardBus) GetMetrics(threadID string) PipelineMetrics {
 			return pm
 		}
 	}
+
+	rootThreadID := b.rootThreadID(threadID)
+	b.activeMetricsMu.RLock()
+	metrics := b.activeMetricsByRootID[rootThreadID]
+	b.activeMetricsMu.RUnlock()
+	if metrics != nil {
+		return metrics
+	}
 	return nil
 }
 
 func (b *SynapseBlackboardBus) SetMetrics(threadID string, metrics PipelineMetrics) {
 	b.metricsStore.Set(threadID, metrics)
+}
+
+func (b *SynapseBlackboardBus) registerExecutionMetrics(rootThreadID string, metrics PipelineMetrics) {
+	b.activeMetricsMu.Lock()
+	b.activeMetricsByRootID[rootThreadID] = metrics
+	b.activeMetricsMu.Unlock()
+}
+
+func (b *SynapseBlackboardBus) releaseExecutionMetrics(rootThreadID string) {
+	b.activeMetricsMu.Lock()
+	delete(b.activeMetricsByRootID, rootThreadID)
+	b.activeMetricsMu.Unlock()
+}
+
+func (b *SynapseBlackboardBus) rootThreadID(threadID string) string {
+	rootThreadID := threadID
+	visited := map[string]struct{}{}
+	for {
+		if _, seen := visited[rootThreadID]; seen {
+			return threadID
+		}
+		visited[rootThreadID] = struct{}{}
+		parentThreadID := b.parents.Get(rootThreadID)
+		if parentThreadID == "" {
+			return rootThreadID
+		}
+		rootThreadID = parentThreadID
+	}
 }
 
 func (b *SynapseBlackboardBus) SendMessage(ctx context.Context, msg synapse.SynapseMessage) (*synapse.SynapseMessage, error) {

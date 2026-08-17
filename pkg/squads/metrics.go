@@ -1,9 +1,12 @@
 package squads
 
 import (
+	"context"
 	"maps"
 	"sync"
 	"time"
+
+	"github.com/embention/agent-squad-go/pkg/observability"
 )
 
 // This file provides the thread-safe metrics model used by squads, agents,
@@ -21,6 +24,7 @@ type AgentMetrics struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	CostUSD          float64
 	LLMCalls         int
 	LLMElapsedTime   time.Duration
 	RetryCount       int
@@ -44,6 +48,7 @@ func (a *AgentMetrics) ToDict() map[string]any {
 		"prompt_tokens":     a.PromptTokens,
 		"completion_tokens": a.CompletionTokens,
 		"total_tokens":      a.TotalTokens,
+		"cost_usd":          a.CostUSD,
 		"llm_calls":         a.LLMCalls,
 		"llm_elapsed_time":  a.LLMElapsedTime,
 		"retry_count":       a.RetryCount,
@@ -61,6 +66,7 @@ type SquadMetrics struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	CostUSD          float64
 	LLMCalls         int
 	LLMElapsedTime   time.Duration
 }
@@ -84,6 +90,7 @@ func (s *SquadMetrics) ToDict() map[string]any {
 		"prompt_tokens":     s.PromptTokens,
 		"completion_tokens": s.CompletionTokens,
 		"total_tokens":      s.TotalTokens,
+		"cost_usd":          s.CostUSD,
 		"llm_calls":         s.LLMCalls,
 		"llm_elapsed_time":  s.LLMElapsedTime,
 	}
@@ -170,27 +177,50 @@ func (t *TaskMetrics) ToDict() map[string]any {
 
 // ExecutionMetrics is the thread-safe PipelineMetrics implementation.
 type ExecutionMetrics struct {
-	mu                 sync.Mutex
-	ThreadID           string
-	Status             string
-	StartTime          time.Time
-	EndTime            time.Time
-	ElapsedTime        time.Duration
-	Squads             map[string]*SquadMetrics
-	Observers          map[string]*ObserverMetrics
-	Transversals       map[string]*TransversalMetrics
-	Tasks              map[string]*TaskMetrics
-	CrossSquadMessages []CrossSquadMessageMetrics
-	Delegations        []map[string]any
-	RetryCount         int
-	ErrorCount         int
-	RetriesByOperation map[string]int
-	ErrorsByCategory   map[string]int
+	mu                  sync.Mutex
+	ThreadID            string
+	Status              string
+	StartTime           time.Time
+	EndTime             time.Time
+	ElapsedTime         time.Duration
+	Squads              map[string]*SquadMetrics
+	Observers           map[string]*ObserverMetrics
+	Transversals        map[string]*TransversalMetrics
+	Tasks               map[string]*TaskMetrics
+	CrossSquadMessages  []CrossSquadMessageMetrics
+	Delegations         []map[string]any
+	RetryCount          int
+	ErrorCount          int
+	RetriesByOperation  map[string]int
+	ErrorsByCategory    map[string]int
+	PromptTokens        int
+	CompletionTokens    int
+	TotalTokens         int
+	CostUSD             float64
+	budget              ExecutionBudget
+	budgetPermit        chan struct{}
+	budgetBlocked       bool
+	budgetUsageSequence uint64
 }
+
+var _ PipelineMetrics = (*ExecutionMetrics)(nil)
+var _ budgetAwarePipelineMetrics = (*ExecutionMetrics)(nil)
 
 // NewExecutionMetrics creates a fresh metrics tracker for a thread.
 func NewExecutionMetrics(threadID string) *ExecutionMetrics {
-	return &ExecutionMetrics{
+	return newExecutionMetrics(threadID, ExecutionBudget{})
+}
+
+// NewExecutionMetricsWithBudget creates a metrics tracker with validated limits.
+func NewExecutionMetricsWithBudget(threadID string, budget ExecutionBudget) (*ExecutionMetrics, error) {
+	if err := budget.Validate(); err != nil {
+		return nil, err
+	}
+	return newExecutionMetrics(threadID, budget), nil
+}
+
+func newExecutionMetrics(threadID string, budget ExecutionBudget) *ExecutionMetrics {
+	metrics := &ExecutionMetrics{
 		ThreadID:           threadID,
 		Status:             "Running",
 		StartTime:          time.Now(),
@@ -200,7 +230,13 @@ func NewExecutionMetrics(threadID string) *ExecutionMetrics {
 		Tasks:              make(map[string]*TaskMetrics),
 		RetriesByOperation: make(map[string]int),
 		ErrorsByCategory:   make(map[string]int),
+		budget:             budget,
 	}
+	if budget.enabled() {
+		metrics.budgetPermit = make(chan struct{}, 1)
+		metrics.budgetPermit <- struct{}{}
+	}
+	return metrics
 }
 
 func (e *ExecutionMetrics) RegisterSquad(squadID string, squad *Squad) {
@@ -479,27 +515,157 @@ func (e *ExecutionMetrics) RecordObserverInteraction(observerName string) {
 func (e *ExecutionMetrics) RecordLLMUsage(squadID, agentID string, prompt, completion, total int, elapsed time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if s, ok := e.Squads[squadID]; ok {
-		if a, ok := s.Subagents[agentID]; ok {
-			a.PromptTokens += prompt
-			a.CompletionTokens += completion
-			a.TotalTokens += total
-			a.LLMCalls++
-			a.LLMElapsedTime += elapsed
-		}
-	}
+	e.recordSubagentLLMUsageLocked(squadID, agentID, prompt, completion, total, 0, elapsed)
 }
 
 func (e *ExecutionMetrics) RecordCoordinatorUsage(squadID string, prompt, completion, total int, elapsed time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if s, ok := e.Squads[squadID]; ok {
-		s.PromptTokens += prompt
-		s.CompletionTokens += completion
-		s.TotalTokens += total
-		s.LLMCalls++
-		s.LLMElapsedTime += elapsed
+	e.recordCoordinatorLLMUsageLocked(squadID, prompt, completion, total, 0, elapsed)
+}
+
+func (e *ExecutionMetrics) acquireLLMBudget(ctx context.Context) (observability.ExecutionBudgetSnapshot, func(), error) {
+	if e.budgetPermit != nil {
+		if err := ctx.Err(); err != nil {
+			return e.BudgetSnapshot(), nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return e.BudgetSnapshot(), nil, ctx.Err()
+		case <-e.budgetPermit:
+		}
+		if err := ctx.Err(); err != nil {
+			e.releaseLLMBudgetPermit()
+			return e.BudgetSnapshot(), nil, err
+		}
 	}
+
+	e.mu.Lock()
+	snapshot := e.budgetSnapshotLocked()
+	if snapshot.Status == string(BudgetStatusExhausted) || snapshot.Status == string(BudgetStatusExceeded) {
+		e.budgetBlocked = true
+		e.mu.Unlock()
+		e.releaseLLMBudgetPermit()
+		return snapshot, nil, &BudgetExceededError{Snapshot: snapshot}
+	}
+	e.mu.Unlock()
+
+	if e.budgetPermit == nil {
+		return snapshot, nil, nil
+	}
+	var releaseOnce sync.Once
+	return snapshot, func() {
+		releaseOnce.Do(e.releaseLLMBudgetPermit)
+	}, nil
+}
+
+func (e *ExecutionMetrics) releaseLLMBudgetPermit() {
+	if e.budgetPermit != nil {
+		e.budgetPermit <- struct{}{}
+	}
+}
+
+func (e *ExecutionMetrics) recordSubagentLLMUsageWithCost(squadID, agentID string, prompt, completion, total int, costUSD float64, elapsed time.Duration) (observability.ExecutionBudgetSnapshot, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.recordSubagentLLMUsageLocked(squadID, agentID, prompt, completion, total, costUSD, elapsed)
+	return e.finishBudgetedLLMUsageLocked()
+}
+
+func (e *ExecutionMetrics) recordCoordinatorLLMUsageWithCost(squadID string, prompt, completion, total int, costUSD float64, elapsed time.Duration) (observability.ExecutionBudgetSnapshot, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.recordCoordinatorLLMUsageLocked(squadID, prompt, completion, total, costUSD, elapsed)
+	return e.finishBudgetedLLMUsageLocked()
+}
+
+func (e *ExecutionMetrics) recordSubagentLLMUsageLocked(squadID, agentID string, prompt, completion, total int, costUSD float64, elapsed time.Duration) {
+	squad := e.ensureSquadLocked(squadID)
+	agent := e.ensureAgentLocked(squadID, agentID)
+	agent.PromptTokens += prompt
+	agent.CompletionTokens += completion
+	agent.TotalTokens += total
+	agent.CostUSD += costUSD
+	agent.LLMCalls++
+	agent.LLMElapsedTime += elapsed
+
+	e.recordSquadLLMUsageLocked(squad, prompt, completion, total, costUSD, elapsed)
+	e.recordExecutionLLMUsageLocked(prompt, completion, total, costUSD)
+}
+
+func (e *ExecutionMetrics) recordCoordinatorLLMUsageLocked(squadID string, prompt, completion, total int, costUSD float64, elapsed time.Duration) {
+	squad := e.ensureSquadLocked(squadID)
+	e.recordSquadLLMUsageLocked(squad, prompt, completion, total, costUSD, elapsed)
+	e.recordExecutionLLMUsageLocked(prompt, completion, total, costUSD)
+}
+
+func (e *ExecutionMetrics) recordSquadLLMUsageLocked(squad *SquadMetrics, prompt, completion, total int, costUSD float64, elapsed time.Duration) {
+	squad.PromptTokens += prompt
+	squad.CompletionTokens += completion
+	squad.TotalTokens += total
+	squad.CostUSD += costUSD
+	squad.LLMCalls++
+	squad.LLMElapsedTime += elapsed
+}
+
+func (e *ExecutionMetrics) recordExecutionLLMUsageLocked(prompt, completion, total int, costUSD float64) {
+	e.PromptTokens += prompt
+	e.CompletionTokens += completion
+	e.TotalTokens += total
+	e.CostUSD += costUSD
+	e.budgetUsageSequence++
+}
+
+func (e *ExecutionMetrics) finishBudgetedLLMUsageLocked() (observability.ExecutionBudgetSnapshot, error) {
+	snapshot := e.budgetSnapshotLocked()
+	if snapshot.Status == string(BudgetStatusExceeded) {
+		e.budgetBlocked = true
+		return snapshot, &BudgetExceededError{Snapshot: snapshot}
+	}
+	return snapshot, nil
+}
+
+func (e *ExecutionMetrics) budgetFailure() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	snapshot := e.budgetSnapshotLocked()
+	if e.budgetBlocked || snapshot.Status == string(BudgetStatusExceeded) {
+		return &BudgetExceededError{Snapshot: snapshot}
+	}
+	return nil
+}
+
+// BudgetSnapshot returns a consistent execution-wide usage and limit snapshot.
+func (e *ExecutionMetrics) BudgetSnapshot() observability.ExecutionBudgetSnapshot {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.budgetSnapshotLocked()
+}
+
+func (e *ExecutionMetrics) budgetSnapshotLocked() observability.ExecutionBudgetSnapshot {
+	snapshot := observability.ExecutionBudgetSnapshot{
+		UsageSequence:    e.budgetUsageSequence,
+		PromptTokens:     e.PromptTokens,
+		CompletionTokens: e.CompletionTokens,
+		TotalTokens:      e.TotalTokens,
+		CostUSD:          e.CostUSD,
+		MaxTotalTokens:   e.budget.MaxTotalTokens,
+		MaxCostUSD:       e.budget.MaxCostUSD,
+	}
+	switch {
+	case !e.budget.enabled():
+		snapshot.Status = string(BudgetStatusDisabled)
+	case (e.budget.MaxTotalTokens > 0 && e.TotalTokens > e.budget.MaxTotalTokens) || (e.budget.MaxCostUSD > 0 && e.CostUSD > e.budget.MaxCostUSD):
+		snapshot.Status = string(BudgetStatusExceeded)
+	case (e.budget.MaxTotalTokens > 0 && e.TotalTokens == e.budget.MaxTotalTokens) || (e.budget.MaxCostUSD > 0 && e.CostUSD == e.budget.MaxCostUSD):
+		snapshot.Status = string(BudgetStatusExhausted)
+	default:
+		snapshot.Status = string(BudgetStatusAvailable)
+	}
+	return snapshot
 }
 
 func (e *ExecutionMetrics) ToDict() map[string]any {
@@ -529,6 +695,7 @@ func (e *ExecutionMetrics) ToDict() map[string]any {
 	if e.EndTime.IsZero() {
 		elapsed = time.Since(e.StartTime)
 	}
+	budget := e.budgetSnapshotLocked()
 	return map[string]any{
 		"thread_id":            e.ThreadID,
 		"status":               e.Status,
@@ -545,5 +712,20 @@ func (e *ExecutionMetrics) ToDict() map[string]any {
 		"retries_by_operation": maps.Clone(e.RetriesByOperation),
 		"error_count":          e.ErrorCount,
 		"errors_by_category":   maps.Clone(e.ErrorsByCategory),
+		"prompt_tokens":        e.PromptTokens,
+		"completion_tokens":    e.CompletionTokens,
+		"total_tokens":         e.TotalTokens,
+		"cost_usd":             e.CostUSD,
+		"budget_status":        budget.Status,
+		"budget": map[string]any{
+			"usage_sequence":    budget.UsageSequence,
+			"prompt_tokens":     budget.PromptTokens,
+			"completion_tokens": budget.CompletionTokens,
+			"total_tokens":      budget.TotalTokens,
+			"cost_usd":          budget.CostUSD,
+			"max_total_tokens":  budget.MaxTotalTokens,
+			"max_cost_usd":      budget.MaxCostUSD,
+			"status":            budget.Status,
+		},
 	}
 }

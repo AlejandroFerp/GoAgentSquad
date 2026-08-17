@@ -725,13 +725,7 @@ func (a *SubAgent) askLLMToHeal(ctx context.Context, threadID, toolName string, 
 			"Error message:\n%s\n\n"+
 			"Analyze the failure. Return ONLY a corrected JSON block for the arguments:\n"+
 			"```json\n{\n  \"arg1\": \"corrected_value\"\n}\n```", toolName, schema, failedArgs, errorMsg)
-	start := a.Clock()
-	res, err := a.LLMCall(ctx, a.Model, healPrompt, nil)
-	elapsed := a.Clock().Sub(start)
-	metrics := a.Blackboard.GetMetrics(threadID)
-	if metrics != nil {
-		metrics.RecordLLMUsage(a.SquadID, a.AgentID, res.PromptTokens, res.CompletionTokens, res.TotalTokens, elapsed)
-	}
+	res, err := a.callLLMObserved(ctx, threadID, healPrompt, nil)
 	if err != nil {
 		return nil, fmt.Errorf("heal tool %q arguments: %w", toolName, err)
 	}
@@ -744,46 +738,26 @@ func (a *SubAgent) askLLMToHeal(ctx context.Context, threadID, toolName string, 
 }
 
 func (a *SubAgent) callLLMObserved(ctx context.Context, threadID, systemPrompt string, messages []map[string]any) (LLMResponse, error) {
-	if a.LLMCall == nil {
-		return LLMResponse{}, nil
-	}
-	llmCtx, span := startObservedSpan(ctx, a.Blackboard, "agent.llm",
-		observability.Attr{Key: observability.AttrAgentID, Value: a.AgentID},
-		observability.Attr{Key: observability.AttrAgentType, Value: a.AgentType},
-		observability.Attr{Key: observability.AttrSquadID, Value: a.SquadID},
-		observability.Attr{Key: observability.AttrThreadID, Value: threadID},
-		observability.Attr{Key: observability.AttrModel, Value: a.Model},
+	return invokeObservedLLMCall(
+		ctx,
+		a.Blackboard,
+		a.LLMCall,
+		observedLLMCall{
+			SpanName:     "agent.llm",
+			AgentID:      a.AgentID,
+			AgentType:    a.AgentType,
+			SquadID:      a.SquadID,
+			ThreadID:     threadID,
+			Model:        a.Model,
+			Summary:      "llm call",
+			SystemPrompt: systemPrompt,
+			Messages:     messages,
+			Clock:        a.Clock,
+		},
+		func(metrics PipelineMetrics, response LLMResponse, elapsed time.Duration) (observability.ExecutionBudgetSnapshot, bool, error) {
+			return recordBudgetedSubagentLLMUsage(metrics, a.SquadID, a.AgentID, response, elapsed)
+		},
 	)
-	startedAt := time.Now()
-	clockStart := a.Clock()
-	res, err := a.LLMCall(llmCtx, a.Model, systemPrompt, messages)
-	clockElapsed := a.Clock().Sub(clockStart)
-	finishedAt := time.Now()
-	metrics := a.Blackboard.GetMetrics(threadID)
-	if metrics != nil {
-		metrics.RecordLLMUsage(a.SquadID, a.AgentID, res.PromptTokens, res.CompletionTokens, res.TotalTokens, clockElapsed)
-	}
-	step := observability.AgentStep{
-		Kind:       observability.StepLLMCall,
-		AgentID:    a.AgentID,
-		AgentType:  a.AgentType,
-		SquadID:    a.SquadID,
-		ThreadID:   threadID,
-		Summary:    "llm call",
-		Model:      a.Model,
-		TokensIn:   res.PromptTokens,
-		TokensOut:  res.CompletionTokens,
-		StartedAt:  startedAt,
-		FinishedAt: finishedAt,
-		LLMTrace:   captureLLMTrace(a.Blackboard, systemPrompt, messages, res),
-	}
-	if err != nil {
-		span.RecordError(err)
-		step.Error = err.Error()
-	}
-	_, _ = recordObservedStep(llmCtx, a.Blackboard, step)
-	span.End()
-	return res, err
 }
 
 // TransversalAgent is a global, shared utility agent that runs outside squads.

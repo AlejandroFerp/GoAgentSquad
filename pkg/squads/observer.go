@@ -27,6 +27,8 @@ type BaseObserver struct {
 	subscription synapse.SubscriptionID
 }
 
+var _ ObserverStarter = (*BaseObserver)(nil)
+
 // Start subscribes the observer to the pre_insert EventBus hook.
 func (o *BaseObserver) Start() {
 	o.mu.Lock()
@@ -73,6 +75,8 @@ type ReferenceExpansionObserver struct {
 	LookupFn func(reference string) string
 	refRegex *regexp.Regexp
 }
+
+var _ ObserverStarter = (*ReferenceExpansionObserver)(nil)
 
 // NewReferenceExpansionObserver builds an observer that expands [Reference]
 // patterns in ContextMessage content.

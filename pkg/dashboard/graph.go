@@ -393,15 +393,38 @@ func workflowStageLabel(summary string, phaseNumber int) string {
 // BuildMetricsSummary derives dashboard summary cards from a query timeline.
 // It summarizes observed execution data; it is not used as a control signal.
 func BuildMetricsSummary(correlationID string, steps []observability.AgentStep) MetricsSummary {
-	summary := MetricsSummary{CorrelationID: correlationID, TotalSteps: len(steps)}
+	summary := MetricsSummary{CorrelationID: correlationID, TotalSteps: len(steps), BudgetStatus: budgetStatusUnavailable}
 	uniqueAgents := map[string]struct{}{}
 	var earliest, latest time.Time
+	usageByCorrelation := map[string]observedUsage{}
+	budgetByCorrelation := map[string]observability.ExecutionBudgetSnapshot{}
 	for _, step := range steps {
+		stepCorrelationID := step.CorrelationID
+		if stepCorrelationID == "" {
+			stepCorrelationID = correlationID
+		}
+		usage := usageByCorrelation[stepCorrelationID]
 		if step.AgentID != "" {
 			uniqueAgents[step.AgentID] = struct{}{}
 		}
 		summary.TotalTokensIn += step.TokensIn
 		summary.TotalTokensOut += step.TokensOut
+		usage.totalTokens += step.TokensIn + step.TokensOut
+		if step.Kind == observability.StepLLMCall {
+			costUSD := step.CostUSD
+			if costUSD == 0 && step.LLMTrace != nil {
+				costUSD = step.LLMTrace.CostUSD
+			}
+			summary.TotalCostUSD += costUSD
+			usage.costUSD += costUSD
+		}
+		usageByCorrelation[stepCorrelationID] = usage
+		if step.Budget != nil {
+			current, exists := budgetByCorrelation[stepCorrelationID]
+			if !exists || step.Budget.UsageSequence >= current.UsageSequence {
+				budgetByCorrelation[stepCorrelationID] = *step.Budget
+			}
+		}
 		if step.Kind == observability.StepLLMCall {
 			summary.LLMCalls++
 		}
@@ -422,11 +445,109 @@ func BuildMetricsSummary(correlationID string, steps []observability.AgentStep) 
 			latest = finish
 		}
 	}
+	summary.TotalTokens = summary.TotalTokensIn + summary.TotalTokensOut
+	if correlationID == WorkflowCorrelationID {
+		applyWorkflowBudgetSummary(&summary, usageByCorrelation, budgetByCorrelation)
+	} else if budget, exists := budgetByCorrelation[correlationID]; exists {
+		applyExecutionBudgetSummary(&summary, budget)
+	}
 	summary.UniqueAgents = len(uniqueAgents)
 	if !earliest.IsZero() && !latest.IsZero() && latest.After(earliest) {
 		summary.DurationMS = latest.Sub(earliest).Milliseconds()
 	}
 	return summary
+}
+
+type observedUsage struct {
+	totalTokens int
+	costUSD     float64
+}
+
+// Projection-only budget statuses. They never appear in a recorded snapshot.
+const (
+	budgetStatusUnavailable = "unavailable"
+	budgetStatusMixed       = "mixed"
+)
+
+func applyExecutionBudgetSummary(summary *MetricsSummary, budget observability.ExecutionBudgetSnapshot) {
+	summary.TotalTokens = budget.TotalTokens
+	summary.TotalCostUSD = budget.CostUSD
+	summary.MaxTotalTokens = budget.MaxTotalTokens
+	summary.MaxCostUSD = budget.MaxCostUSD
+	summary.BudgetStatus = budget.Status
+}
+
+func applyWorkflowBudgetSummary(summary *MetricsSummary, usageByCorrelation map[string]observedUsage, budgetByCorrelation map[string]observability.ExecutionBudgetSnapshot) {
+	if len(budgetByCorrelation) == 0 {
+		return
+	}
+
+	totalTokens := 0
+	totalCostUSD := 0.0
+	for correlationID, usage := range usageByCorrelation {
+		if budget, exists := budgetByCorrelation[correlationID]; exists {
+			totalTokens += budget.TotalTokens
+			totalCostUSD += budget.CostUSD
+			continue
+		}
+		totalTokens += usage.totalTokens
+		totalCostUSD += usage.costUSD
+	}
+	for correlationID, budget := range budgetByCorrelation {
+		if _, exists := usageByCorrelation[correlationID]; exists {
+			continue
+		}
+		totalTokens += budget.TotalTokens
+		totalCostUSD += budget.CostUSD
+	}
+
+	summary.TotalTokens = totalTokens
+	summary.TotalCostUSD = totalCostUSD
+	summary.BudgetStatus = workflowBudgetStatus(budgetByCorrelation)
+	if len(budgetByCorrelation) != len(usageByCorrelation) {
+		if summary.BudgetStatus != observability.BudgetStatusExceeded && summary.BudgetStatus != observability.BudgetStatusExhausted {
+			summary.BudgetStatus = budgetStatusMixed
+		}
+		return
+	}
+
+	totalTokenLimit := 0
+	totalCostLimit := 0.0
+	for _, budget := range budgetByCorrelation {
+		if budget.MaxTotalTokens == 0 {
+			totalTokenLimit = 0
+			break
+		}
+		totalTokenLimit += budget.MaxTotalTokens
+	}
+	for _, budget := range budgetByCorrelation {
+		if budget.MaxCostUSD == 0 {
+			totalCostLimit = 0
+			break
+		}
+		totalCostLimit += budget.MaxCostUSD
+	}
+	summary.MaxTotalTokens = totalTokenLimit
+	summary.MaxCostUSD = totalCostLimit
+}
+
+func workflowBudgetStatus(budgetByCorrelation map[string]observability.ExecutionBudgetSnapshot) string {
+	statuses := map[string]struct{}{}
+	for _, budget := range budgetByCorrelation {
+		statuses[budget.Status] = struct{}{}
+	}
+	if len(statuses) == 1 {
+		for status := range statuses {
+			return status
+		}
+	}
+	if _, exists := statuses[observability.BudgetStatusExceeded]; exists {
+		return observability.BudgetStatusExceeded
+	}
+	if _, exists := statuses[observability.BudgetStatusExhausted]; exists {
+		return observability.BudgetStatusExhausted
+	}
+	return budgetStatusMixed
 }
 
 func addHubMetrics(summary MetricsSummary, hub *observability.Hub) MetricsSummary {

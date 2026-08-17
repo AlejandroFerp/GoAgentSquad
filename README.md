@@ -1,6 +1,5 @@
 # Agent Squad Go
 
-A Go port of the AGAPES Agent Squads framework and Synapse blackboard engine, redesigned for safe concurrent multi-agent execution, traceability, and human-friendly observability.
 
 ## What This Project Provides
 
@@ -91,9 +90,9 @@ flowchart TB
 | Trace export and replay | `pkg/observability/exporter.go` | Writes JSONL traces and incrementally replays complete records without duplicating steps. | `tests/observability`, `tests/dashboard` |
 | External telemetry | `pkg/observability/tracer.go`, `otel_runtime.go` | Supplies noop, recorder, and optional OpenTelemetry tracing implementations. | `tests/observability` |
 | Dashboard projections | `pkg/dashboard/api.go`, `graph.go`, `sse.go` | Serves query timelines, workflow graphs, metrics, embedded assets, and live `AgentStep` events. | `tests/dashboard` |
-| Dashboard frontend | `pkg/dashboard/web/` | Renders the workflow graph, query drawer, timeline, metrics, logs, and inspector from read-only projections. | `node --check pkg/dashboard/web/app.js` |
+| Dashboard frontend | `pkg/dashboard/web/` | Renders Mermaid Sequence, State, Mindmap, and Flowchart views with chronological events, query drawer, timeline, metrics, logs, tooltips, PNG export, and participant inspector from read-only projections. | `node --check pkg/dashboard/web/app.js`, `tests/e2e` |
 | End-to-end demo | `cmd/squad-demo/main.go` | Demonstrates provider-neutral wiring with optional dashboard, JSONL, and OpenTelemetry integrations. | `go run ./cmd/squad-demo/` |
-| Local workflow experiment | `local-tests/company-ai-impact/` | Exercises a larger declarative multi-phase workflow without adding application-specific behavior to core packages. | Nested module tests and mock run |
+| Manual compatibility experiment | `local-tests/use-case/` | Runs four declarative squads for manual discovery, concurrent evidence ingestion, compatibility synthesis, and reporting without adding domain behavior to core packages. | Nested module tests and mock run |
 
 ## Package Responsibilities
 
@@ -204,6 +203,10 @@ runtime defaults when a workflow needs a different provider or delegation policy
 `runtime.Observability()` as the source for the embedded dashboard and `runtime.Close()` during
 application shutdown.
 
+An `AgentDefinition` may also provide a `Tools` map of named `squads.LocalTool` values. The runtime
+registers those tools before broadcasting topology, so declarative agents expose the same local-tool
+execution and healing behavior as agents assembled manually.
+
 ### Optional LLM audit payloads
 
 The dashboard always records observable lifecycle events such as agent starts, LLM calls, tool
@@ -216,15 +219,23 @@ Captured audit payloads contain only application-visible request and response da
 contain, request, infer, or present private model chain-of-thought. Restrict dashboard access and
 trace retention according to the sensitivity of the prompts and completions.
 
-### Reading the execution graph
+### Reading the execution diagrams
 
-Graph lines represent observed orchestration events, not an assumption that every agent talks directly
-to every other agent. `route` means a query phase selected a squad, `runs` means that squad assigned an
-agent, `result` means an agent published its output back to its squad, and `summary` means the squad
-coordinator published its combined output to the query phase. Tool and cross-agent delegation events
-appear only when the workflow actually invokes them. Selecting an agent or squad node opens an inspector
-that states the observed coordination pattern and lists its events. A `running` status is based on the
-last observable lifecycle state; a squad becomes `done` when its own coordinator synthesis is recorded.
+The dashboard offers four Mermaid presentations of the same read-only execution projection:
+
+- `Sequence`: participants represent the pipeline, phases, squads, agents, coordinators, model calls,
+	and tools; numbered messages follow `AgentStep` order downward as work progresses.
+- `State`: each lifecycle event becomes a state transition, making the progression from query receipt to
+	routing, agent work, response, quiescence, or error explicit.
+- `Mindmap`: the former flow topology is represented as a Mermaid hierarchy from workflow to phases,
+	squads, agents, coordinators, and tools.
+- `Flow`: the original process-oriented view is represented as a Mermaid `flowchart TD` with labeled
+	directed relationships.
+
+Tooltips and clicks are available on participants, states, mindmap nodes, and semantic transitions; they
+open the same observed-execution inspector used by the timeline. The diagram toolbar supports 25%-300%
+zoom, pointer-centered wheel zoom, drag panning, fullscreen, and PNG export. The REST API still exposes
+graph nodes and edges for machine consumers independently of the browser view.
 
 The lower-level assembly remains available for advanced integrations that need direct control of
 Synapse, custom observer registration, or incremental component construction:
@@ -405,6 +416,33 @@ go run ./cmd/squad-dashboard --addr 127.0.0.1:8080 --trace-file ./traces/agent-s
 The standalone dashboard tails the JSONL file incrementally and deduplicates steps by `step_id`, so you can refresh or reopen the UI without duplicating the visual timeline. It only replays
 newline-terminated records, preserving its byte offset when a writer is in the middle of appending a
 record. Malformed complete lines are skipped and counted in loader diagnostics.
+
+### Manual compatibility experiment
+
+The committed experiment uses four squads to audit `https://manuals.embention.com/`: one navigator,
+four concurrent technical readers, four compatibility verifiers, and one report formatter. Discovery
+walks the complete navigation tree, including collapsed `Apps`, frameworks, and `Discontinued` sections,
+then expands every `latest` alias into concrete product/manual versions such as `4.12⧸1.6`. The default
+analysis scope is the current `1x` ecosystem (use `--scope all` to widen it); readers create compact
+evidence facts, Go generates bounded candidate edges, and verifiers inspect each candidate against direct
+Embention excerpts. Its mock mode uses versioned local HTML fixtures and never calls OpenRouter.
+
+```powershell
+Push-Location .\local-tests\use-case
+go test ./... -count=1
+.\run.ps1 --mock --exit-after-run
+Pop-Location
+```
+
+The run writes `manual-audit-report.md`, `manual-vs-product.json`, and `compatibility-matrix.md` in
+the experiment directory. The matrix is sparse: it contains candidate relationships that were actually
+verified or explicitly left `Not specified`, not every Cartesian product pair. For a live run, create an experiment-local `.env` with
+`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, and optional fallback/provider settings, then omit
+`--mock`. A blocked page or failed section is retained as a blind spot; it is never converted into a
+compatibility claim without a direct versioned section URL and verbatim manual quote. `.env.example`
+recommends `openai/gpt-5.6-luna` for candidate verification through `OPENROUTER_VERIFIER_MODEL`; the
+local `.env` remains user-managed. Use `--all-versions` when historical product versions must also be
+verified.
 
 ## Dashboard API
 

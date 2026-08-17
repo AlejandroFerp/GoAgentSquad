@@ -134,6 +134,7 @@ type SquadsPipeline struct {
 	Observers        []ObserverStarter
 	RouteQueryFn     func(ctx context.Context, content string) ([]string, error)
 	MaxIterations    int
+	executionBudget  ExecutionBudget
 
 	mu                 sync.Mutex
 	executions         *BoundedMap
@@ -151,6 +152,13 @@ type SquadsPipeline struct {
 type ObserverStarter interface {
 	Start()
 	Stop()
+}
+
+// executionMetricsRegistry keeps active metrics reachable when an execution
+// creates more child threads than the bounded historical metrics registry retains.
+type executionMetricsRegistry interface {
+	registerExecutionMetrics(rootThreadID string, metrics PipelineMetrics)
+	releaseExecutionMetrics(rootThreadID string)
 }
 
 // NewSquadsPipeline builds a pipeline with the given blackboard.
@@ -238,6 +246,23 @@ func (p *SquadsPipeline) GetMetrics(threadID string) map[string]any {
 		}
 	}
 	return nil
+}
+
+// SetExecutionBudget configures limits applied independently to each new query.
+func (p *SquadsPipeline) SetExecutionBudget(budget ExecutionBudget) error {
+	if err := budget.Validate(); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.executionBudget = budget
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *SquadsPipeline) executionBudgetSnapshot() ExecutionBudget {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.executionBudget
 }
 
 func (p *SquadsPipeline) broadcastGlobalTopology() {
@@ -562,8 +587,15 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 		return nil, err
 	}
 
-	metrics := NewExecutionMetrics(threadID)
+	metrics, err := NewExecutionMetricsWithBudget(threadID, p.executionBudgetSnapshot())
+	if err != nil {
+		rootSpan.RecordError(err)
+		return nil, fmt.Errorf("create execution metrics: %w", err)
+	}
 	p.Blackboard.SetMetrics(threadID, metrics)
+	if registry, ok := p.Blackboard.(executionMetricsRegistry); ok {
+		registry.registerExecutionMetrics(threadID, metrics)
+	}
 	p.executions.Set(threadID, metrics)
 
 	p.broadcastGlobalTopology()
@@ -599,6 +631,9 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 			}
 		}
 		completedThreadIDs := p.Blackboard.ParentThreads().DeleteTree(threadID)
+		if registry, ok := p.Blackboard.(executionMetricsRegistry); ok {
+			registry.releaseExecutionMetrics(threadID)
+		}
 		p.releaseExecutionState(completedThreadIDs)
 		for _, squad := range p.Squads {
 			squad.releaseThreads(completedThreadIDs)
@@ -636,6 +671,7 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 		Kind:       observability.StepRouted,
 		ThreadID:   threadID,
 		Summary:    fmt.Sprintf("routed to squads: %s", strings.Join(squadIDs, ", ")),
+		Budget:     budgetSnapshotPointer(metrics.BudgetSnapshot()),
 		StartedAt:  routeTime,
 		FinishedAt: routeTime,
 	})
@@ -715,6 +751,22 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 	}
 	p.mu.Unlock()
 
+	if budgetErr := budgetFailureFromMetrics(metrics); budgetErr != nil {
+		status = "Failed"
+		rootSpan.RecordError(budgetErr)
+		errTime := time.Now()
+		_, _ = recordObservedStep(ctx, p.Blackboard, observability.AgentStep{
+			Kind:       observability.StepError,
+			ThreadID:   threadID,
+			Summary:    observedSummary(budgetErr.Error()),
+			Error:      budgetErr.Error(),
+			Budget:     budgetSnapshotPointer(metrics.BudgetSnapshot()),
+			StartedAt:  errTime,
+			FinishedAt: errTime,
+		})
+		return nil, budgetErr
+	}
+
 	history, _ := p.Blackboard.FetchContext(ctx, threadID, 100)
 
 	var response string
@@ -726,6 +778,7 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 		Kind:       observability.StepQuiesced,
 		ThreadID:   threadID,
 		Summary:    "execution tree reached quiescence",
+		Budget:     budgetSnapshotPointer(metrics.BudgetSnapshot()),
 		StartedAt:  completeTime,
 		FinishedAt: completeTime,
 	})
@@ -762,4 +815,8 @@ func (p *SquadsPipeline) Query(ctx context.Context, threadID string, initialSqua
 			TotalSteps:       len(timeline),
 		},
 	}, nil
+}
+
+func budgetSnapshotPointer(snapshot observability.ExecutionBudgetSnapshot) *observability.ExecutionBudgetSnapshot {
+	return &snapshot
 }

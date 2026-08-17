@@ -44,29 +44,53 @@ type LLMTrace struct {
 	ReasoningTokens int          `json:"reasoning_tokens,omitempty"`
 }
 
+// Execution budget statuses that a recorded snapshot can carry. They are the
+// shared vocabulary between the squads runtime and observability consumers.
+const (
+	BudgetStatusDisabled  = "disabled"
+	BudgetStatusAvailable = "available"
+	BudgetStatusExhausted = "exhausted"
+	BudgetStatusExceeded  = "exceeded"
+)
+
+// ExecutionBudgetSnapshot records execution-wide LLM usage and configured limits.
+// It is independent of the squads runtime so observability consumers can render it.
+type ExecutionBudgetSnapshot struct {
+	UsageSequence    uint64  `json:"usage_sequence"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	TotalTokens      int     `json:"total_tokens"`
+	CostUSD          float64 `json:"cost_usd"`
+	MaxTotalTokens   int     `json:"max_total_tokens"`
+	MaxCostUSD       float64 `json:"max_cost_usd"`
+	Status           string  `json:"status"`
+}
+
 // AgentStep is a serializable, business-level record of one observable action.
 type AgentStep struct {
-	StepID        string    `json:"step_id"`
-	ParentStepID  string    `json:"parent_step_id,omitempty"`
-	CorrelationID string    `json:"correlation_id"`
-	TraceID       string    `json:"trace_id"`
-	SpanID        string    `json:"span_id"`
-	Kind          StepKind  `json:"kind"`
-	AgentID       string    `json:"agent_id,omitempty"`
-	AgentType     string    `json:"agent_type,omitempty"`
-	SquadID       string    `json:"squad_id,omitempty"`
-	ThreadID      string    `json:"thread_id,omitempty"`
-	MessageID     string    `json:"message_id,omitempty"`
-	Summary       string    `json:"summary,omitempty"`
-	Model         string    `json:"model,omitempty"`
-	TokensIn      int       `json:"tokens_in,omitempty"`
-	TokensOut     int       `json:"tokens_out,omitempty"`
-	ToolName      string    `json:"tool_name,omitempty"`
-	StartedAt     time.Time `json:"started_at"`
-	FinishedAt    time.Time `json:"finished_at,omitempty"`
-	DurationMS    int64     `json:"duration_ms,omitempty"`
-	Error         string    `json:"error,omitempty"`
-	LLMTrace      *LLMTrace `json:"llm_trace,omitempty"`
+	StepID        string                   `json:"step_id"`
+	ParentStepID  string                   `json:"parent_step_id,omitempty"`
+	CorrelationID string                   `json:"correlation_id"`
+	TraceID       string                   `json:"trace_id"`
+	SpanID        string                   `json:"span_id"`
+	Kind          StepKind                 `json:"kind"`
+	AgentID       string                   `json:"agent_id,omitempty"`
+	AgentType     string                   `json:"agent_type,omitempty"`
+	SquadID       string                   `json:"squad_id,omitempty"`
+	ThreadID      string                   `json:"thread_id,omitempty"`
+	MessageID     string                   `json:"message_id,omitempty"`
+	Summary       string                   `json:"summary,omitempty"`
+	Model         string                   `json:"model,omitempty"`
+	TokensIn      int                      `json:"tokens_in,omitempty"`
+	TokensOut     int                      `json:"tokens_out,omitempty"`
+	CostUSD       float64                  `json:"cost_usd,omitempty"`
+	Budget        *ExecutionBudgetSnapshot `json:"budget,omitempty"`
+	ToolName      string                   `json:"tool_name,omitempty"`
+	StartedAt     time.Time                `json:"started_at"`
+	FinishedAt    time.Time                `json:"finished_at,omitempty"`
+	DurationMS    int64                    `json:"duration_ms,omitempty"`
+	Error         string                   `json:"error,omitempty"`
+	LLMTrace      *LLMTrace                `json:"llm_trace,omitempty"`
 }
 
 type QuerySummary struct {

@@ -2,17 +2,22 @@ package squads
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/embention/agent-squad-go/pkg/observability"
 )
 
 type blockingSynthesizer struct {
 	starts  chan struct{}
 	release chan struct{}
 }
+
+var _ FinalSynthesizer = (*blockingSynthesizer)(nil)
 
 func (s *blockingSynthesizer) Synthesize(context.Context, string, string) error {
 	s.starts <- struct{}{}
@@ -129,12 +134,53 @@ func TestQueryTimeoutReleasesExecutionState(t *testing.T) {
 	if parentThreads := bus.ParentThreads().Keys(); len(parentThreads) != 0 {
 		t.Fatalf("parent threads = %v, want none after timeout cleanup", parentThreads)
 	}
-	if _, exists := pipeline.threadToSquadMap["timeout-root"]; exists {
+	pipeline.mu.Lock()
+	_, rootExists := pipeline.threadToSquadMap["timeout-root"]
+	iterationCount := len(pipeline.iterationCounter)
+	exceptionCount := len(pipeline.exceptions)
+	pipeline.mu.Unlock()
+	if rootExists {
 		t.Fatal("pipeline retained the timed-out root thread")
 	}
-	if len(pipeline.iterationCounter) != 0 || len(pipeline.exceptions) != 0 {
+	if iterationCount != 0 || exceptionCount != 0 {
 		t.Fatal("pipeline retained timed-out execution counters or exceptions")
 	}
+}
+
+func TestQueryReturnsFailureWhenLLMUsageExceedsExecutionBudget(t *testing.T) {
+	bus := newConnectedBus(t)
+	pipeline := NewSquadsPipeline(bus, nil, 1)
+	if err := pipeline.SetExecutionBudget(ExecutionBudget{MaxTotalTokens: 5, MaxCostUSD: 0.01}); err != nil {
+		t.Fatalf("SetExecutionBudget() error = %v", err)
+	}
+
+	squad := NewSquad("budget-squad", "Budget Squad", "", bus)
+	agent := NewSubAgent("budget-agent", "Agent", "", "system", bus, squad.SquadID)
+	agent.LLMCall = func(context.Context, string, string, []map[string]any) (LLMResponse, error) {
+		return LLMResponse{Content: "response", PromptTokens: 4, CompletionTokens: 2, TotalTokens: 6, CostUSD: 0.02}, nil
+	}
+	squad.RegisterSubAgent(agent)
+	pipeline.RegisterSquad(squad)
+
+	result, err := pipeline.Query(context.Background(), "budget-root", []string{squad.SquadID}, "query", time.Second)
+	if result != nil {
+		t.Fatalf("Query() result = %#v, want nil after budget failure", result)
+	}
+	if !errors.Is(err, ErrExecutionBudgetExceeded) {
+		t.Fatalf("Query() error = %v, want budget error", err)
+	}
+
+	metrics := pipeline.GetMetrics("budget-root")
+	if metrics["status"] != "Failed" || metrics["budget_status"] != string(BudgetStatusExceeded) {
+		t.Fatalf("metrics = %#v, want failed execution and exceeded budget", metrics)
+	}
+	timeline := bus.Observability().Ledger.Timeline("budget-root")
+	for _, step := range timeline {
+		if step.Kind == observability.StepError && step.ThreadID == "budget-root" && strings.Contains(step.Error, "execution budget") {
+			return
+		}
+	}
+	t.Fatal("expected a root budget error in the timeline")
 }
 
 func TestSquadCompletionStopsAtMaximumIterations(t *testing.T) {

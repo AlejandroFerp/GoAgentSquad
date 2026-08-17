@@ -36,6 +36,8 @@ type MemoryStorage struct {
 	messages map[string]SynapseMessage
 }
 
+var _ BaseStorage = (*MemoryStorage)(nil)
+
 // NewMemoryStorage returns an empty retaining in-memory storage backend.
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{messages: make(map[string]SynapseMessage)}
@@ -84,6 +86,8 @@ func (s *MemoryStorage) LoadAllActiveMessages(_ context.Context) ([]SynapseMessa
 
 // NoopStorage is an explicitly selected discard backend. It retains nothing.
 type NoopStorage struct{}
+
+var _ BaseStorage = NoopStorage{}
 
 func (NoopStorage) Connect(context.Context) error                     { return nil }
 func (NoopStorage) Close() error                                      { return nil }

@@ -476,6 +476,76 @@ func TestNewRuntimeBuildsDeclarativeSquad(t *testing.T) {
 	}
 }
 
+func TestNewRuntimeRegistersDeclarativeLocalTools(t *testing.T) {
+	var toolCalls atomic.Int32
+	var receivedValue string
+	llm := func(ctx context.Context, model, systemPrompt string, messages []map[string]any) (squads.LLMResponse, error) {
+		if strings.Contains(systemPrompt, "Integrate the tool result") {
+			return squads.LLMResponse{Content: "tool result integrated"}, nil
+		}
+		return squads.LLMResponse{Content: `{"call_tool":"echo","arguments":{"value":"from declarative tool"}}`}, nil
+	}
+
+	runtime, err := squads.NewRuntime(context.Background(), squads.RuntimeConfig{
+		Model:   "tool-model",
+		LLMCall: llm,
+		Squads: []squads.SquadDefinition{{
+			ID: "tool-squad",
+			Agents: []squads.AgentDefinition{{
+				ID:           "tool-agent",
+				Type:         "TOOL_AGENT",
+				SystemPrompt: "Use the echo tool.",
+				Tools: map[string]squads.LocalTool{
+					"echo": {
+						Schema: squads.ToolSchema{
+							Name:        "echo",
+							Description: "Returns the supplied value.",
+							Parameters:  map[string]squads.ToolParam{"value": {Type: "string", Required: true}},
+						},
+						Func: func(arguments map[string]any) (any, error) {
+							toolCalls.Add(1)
+							receivedValue, _ = arguments["value"].(string)
+							return receivedValue, nil
+						},
+					},
+				},
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+
+	result, err := runtime.Query(context.Background(), "declarative-tool-runtime", []string{"tool-squad"}, "run the echo tool", time.Second)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if toolCalls.Load() != 1 || receivedValue != "from declarative tool" {
+		t.Fatalf("tool calls = %d, value = %q, want one declarative echo call", toolCalls.Load(), receivedValue)
+	}
+	historyContainsIntegratedResult := false
+	for _, message := range result.History {
+		if strings.Contains(message.Content(), "tool result integrated") {
+			historyContainsIntegratedResult = true
+			break
+		}
+	}
+	if !historyContainsIntegratedResult {
+		t.Fatalf("history = %#v, want integrated tool result", result.History)
+	}
+	toolStepFound := false
+	for _, step := range result.Timeline {
+		if step.Kind == observability.StepToolCall && step.ToolName == "echo" {
+			toolStepFound = true
+			break
+		}
+	}
+	if !toolStepFound {
+		t.Fatal("expected declarative local tool call in the observed timeline")
+	}
+}
+
 func TestRuntimeCapturesLLMRequestAndCompletionWhenEnabled(t *testing.T) {
 	runtime, err := squads.NewRuntime(context.Background(), squads.RuntimeConfig{
 		CaptureLLMContent: true,

@@ -55,11 +55,18 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			fmt.Fprintf(w, "event: %s\n", step.Kind)
+			fmt.Fprintf(w, "event: %s\n", sseEventName(step.Kind))
 			fmt.Fprintf(w, "data: %s\n\n", payload)
 			flusher.Flush()
 		}
 	}
+}
+
+func sseEventName(kind observability.StepKind) string {
+	if kind == observability.StepError {
+		return "agent_error"
+	}
+	return string(kind)
 }
 
 var _ = observability.AgentStep{}
