@@ -2,6 +2,7 @@ package synapse
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -27,18 +28,20 @@ type SynapseService struct {
 	messageIndex map[string]SynapseMessage
 
 	// gcCancel/gcDone coordinate the background expiry loop lifecycle.
-	gcCancel context.CancelFunc
-	gcDone   chan struct{}
+	gcCancel  context.CancelFunc
+	gcDone    chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewSynapseService builds a SynapseService with the given cache size and
-// optional storage. If storage is nil, a NoopStorage is used.
+// optional storage. If storage is nil, a retaining MemoryStorage is used.
 func NewSynapseService(cacheSize int, storage BaseStorage) *SynapseService {
 	if cacheSize <= 0 {
 		cacheSize = 50
 	}
 	if storage == nil {
-		storage = NoopStorage{}
+		storage = NewMemoryStorage()
 	}
 	return &SynapseService{
 		cacheSize:    cacheSize,
@@ -61,14 +64,17 @@ func (s *SynapseService) Connect(ctx context.Context) error {
 	}
 	// Rebuild in-memory state deterministically from oldest to newest message.
 	sort.Slice(active, func(i, j int) bool {
-		return active[i].Timestamp < active[j].Timestamp
+		return active[i].Timestamp.Before(active[j].Timestamp)
 	})
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, msg := range active {
+		if err := msg.Validate(); err != nil {
+			return fmt.Errorf("validate persisted message %q: %w", msg.ID, err)
+		}
 		s.messageIndex[msg.ID] = msg
 		s.threads[msg.ThreadID] = append(s.threads[msg.ThreadID], msg)
 	}
-	s.mu.Unlock()
 
 	gcCtx, cancel := context.WithCancel(context.Background())
 	s.gcCancel = cancel
@@ -79,24 +85,33 @@ func (s *SynapseService) Connect(ctx context.Context) error {
 
 // Close stops the GC loop and closes the storage backend.
 func (s *SynapseService) Close() error {
-	if s.gcCancel != nil {
-		s.gcCancel()
-		<-s.gcDone
-		s.gcCancel = nil
-	}
-	return s.storage.Close()
+	s.closeOnce.Do(func() {
+		if s.gcCancel != nil {
+			s.gcCancel()
+			<-s.gcDone
+			s.gcCancel = nil
+		}
+		s.closeErr = s.storage.Close()
+	})
+	return s.closeErr
 }
 
 // SendMessage emits pre-insert hooks, persists the message, updates caches,
 // and finally emits post-insert hooks. Returns the (possibly mutated) message
 // or nil if a pre-insert callback blocked insertion.
 func (s *SynapseService) SendMessage(ctx context.Context, msg SynapseMessage) (*SynapseMessage, error) {
+	if err := msg.Validate(); err != nil {
+		return nil, err
+	}
 	current, err := s.Events.EmitPreInsert(ctx, msg)
 	if err != nil {
 		return nil, err
 	}
 	if current == nil {
 		return nil, nil
+	}
+	if err := current.Validate(); err != nil {
+		return nil, err
 	}
 	// Persist trace metadata with the message so async callbacks can rebuild causality.
 	if trace, ok := observability.TraceFromContext(ctx); ok {
@@ -114,17 +129,22 @@ func (s *SynapseService) SendMessage(ctx context.Context, msg SynapseMessage) (*
 		current.Trace.CausationID = stepID
 	}
 
-	if err := s.storage.SaveMessage(ctx, *current); err != nil {
+	// Detach the persisted message from the pre-insert message and from the
+	// value returned to the caller. Payload is mutable through SetPayloadValue,
+	// so each ownership boundary must receive its own copy.
+	persisted := cloneMessage(*current)
+	if err := s.storage.SaveMessage(ctx, persisted); err != nil {
 		return nil, err
 	}
 
 	s.mu.Lock()
-	s.insertMessageLocked(*current)
+	s.insertMessageLocked(persisted)
 	s.mu.Unlock()
 
 	// Post-insert callbacks dispatch squads/observers asynchronously.
-	s.Events.EmitPostInsert(ctx, *current)
-	return current, nil
+	s.Events.EmitPostInsert(ctx, cloneMessage(persisted))
+	result := cloneMessage(persisted)
+	return &result, nil
 }
 
 // FetchContext retrieves up to limit ContextMessages for a thread, oldest first.
@@ -133,34 +153,25 @@ func (s *SynapseService) FetchContext(ctx context.Context, threadID string, limi
 	if limit <= 0 {
 		limit = 100
 	}
-	now := nowSeconds()
+	now := time.Now()
 
 	s.mu.RLock()
 	if cache, ok := s.contextCache[threadID]; ok && len(cache) >= limit {
-		cached := cache[len(cache)-limit:]
-		out := make([]SynapseMessage, 0, len(cached))
-		for _, msg := range cached {
-			out = append(out, cloneMessage(msg))
+		active := activeContextMessages(cache, now)
+		if len(active) >= limit {
+			start := len(active) - limit
+			out := active[start:]
+			s.mu.RUnlock()
+			return out, nil
 		}
-		s.mu.RUnlock()
-		return out, nil
 	}
 
 	all := s.threads[threadID]
-	active := make([]SynapseMessage, 0, len(all))
-	for _, m := range all {
-		if m.MessageClass != ClassContextMessage {
-			continue
-		}
-		if m.IsExpired(now) {
-			continue
-		}
-		active = append(active, cloneMessage(m))
-	}
+	active := activeContextMessages(all, now)
 	s.mu.RUnlock()
 
 	sort.Slice(active, func(i, j int) bool {
-		return active[i].Timestamp < active[j].Timestamp
+		return active[i].Timestamp.Before(active[j].Timestamp)
 	})
 
 	start := 0
@@ -191,7 +202,7 @@ func (s *SynapseService) ConsumeTask(ctx context.Context, threadID, squadID, tas
 	if limit <= 0 {
 		limit = 1
 	}
-	now := nowSeconds()
+	now := time.Now()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -232,7 +243,7 @@ func (s *SynapseService) ConsumeTask(ctx context.Context, threadID, squadID, tas
 	}
 
 	sort.Slice(matching, func(i, j int) bool {
-		return matching[i].Timestamp < matching[j].Timestamp
+		return matching[i].Timestamp.Before(matching[j].Timestamp)
 	})
 
 	if len(matching) > limit {
@@ -249,7 +260,7 @@ func (s *SynapseService) ConsumeTask(ctx context.Context, threadID, squadID, tas
 				return nil, err
 			}
 		} else {
-			if err := s.storage.SaveMessage(ctx, updated); err != nil {
+			if err := s.storage.SaveMessage(ctx, cloneMessage(updated)); err != nil {
 				return nil, err
 			}
 			s.replaceMessageLocked(updated)
@@ -386,7 +397,7 @@ func (s *SynapseService) gcLoop(ctx context.Context) {
 
 // CollectExpired purges all expired messages from memory and storage.
 func (s *SynapseService) CollectExpired(ctx context.Context) {
-	now := nowSeconds()
+	now := time.Now()
 	s.mu.Lock()
 	expiredIDs := make([]string, 0)
 	for id, m := range s.messageIndex {
@@ -405,19 +416,20 @@ func (s *SynapseService) CollectExpired(ctx context.Context) {
 	s.mu.Unlock()
 }
 
-// nowSeconds returns wall-clock seconds for message timestamps and TTL checks.
-func nowSeconds() float64 {
-	return float64(time.Now().UnixNano()) / 1e9
+func activeContextMessages(messages []SynapseMessage, now time.Time) []SynapseMessage {
+	active := make([]SynapseMessage, 0, len(messages))
+	for _, msg := range messages {
+		if msg.MessageClass != ClassContextMessage || msg.IsExpired(now) {
+			continue
+		}
+		active = append(active, cloneMessage(msg))
+	}
+	return active
 }
 
-// cloneMessage copies the message payload map so callers cannot mutate cached state.
+// cloneMessage copies the message payload so callers cannot mutate cached state.
 func cloneMessage(m SynapseMessage) SynapseMessage {
 	cp := m
-	if m.Payload != nil {
-		cp.Payload = make(Payload, len(m.Payload))
-		for k, v := range m.Payload {
-			cp.Payload[k] = v
-		}
-	}
+	cp.Payload = m.Payload.Clone()
 	return cp
 }

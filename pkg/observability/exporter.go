@@ -1,7 +1,7 @@
 package observability
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -68,9 +68,27 @@ func (*JSONFileExporter) Shutdown(context.Context) error { return nil }
 // JSONFileLoader incrementally loads step traces from a JSONL file. It keeps an
 // internal byte offset so repeated Sync calls only ingest newly appended lines.
 type JSONFileLoader struct {
-	mu     sync.Mutex
-	Path   string
-	offset int64
+	mu             sync.Mutex
+	Path           string
+	offset         int64
+	malformedLines int
+}
+
+const maxJSONLDiagnostics = 100
+
+// JSONLDiagnostics describes non-fatal input problems observed during replay.
+type JSONLDiagnostics struct {
+	MalformedLines int `json:"malformed_lines"`
+}
+
+// Diagnostics returns the loader's accumulated, bounded replay diagnostics.
+func (l *JSONFileLoader) Diagnostics() JSONLDiagnostics {
+	if l == nil {
+		return JSONLDiagnostics{}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return JSONLDiagnostics{MalformedLines: l.malformedLines}
 }
 
 // Sync reads newly appended JSONL steps from Path and records them into ledger.
@@ -106,25 +124,30 @@ func (l *JSONFileLoader) Sync(ledger *StepLedger) error {
 		return fmt.Errorf("seek trace input file %s: %w", l.Path, err)
 	}
 
-	reader := bufio.NewReader(file)
-	bytesRead := int64(0)
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			bytesRead += int64(len(line))
-			var step AgentStep
-			// Ignore malformed lines and keep replay moving.
-			if unmarshalErr := json.Unmarshal(line, &step); unmarshalErr == nil {
-				ledger.Record(step)
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("read trace input file %s: %w", l.Path, err)
-		}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return fmt.Errorf("read trace input file %s: %w", l.Path, err)
 	}
-	l.offset += bytesRead
+	lastNewline := bytes.LastIndexByte(data, '\n')
+	if lastNewline < 0 {
+		// Leave offset unchanged so a concurrently appended suffix is replayed
+		// together with this incomplete line on the next Sync call.
+		return nil
+	}
+	complete := data[:lastNewline+1]
+	for _, line := range bytes.Split(complete, []byte{'\n'}) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var step AgentStep
+		if unmarshalErr := json.Unmarshal(line, &step); unmarshalErr != nil {
+			if l.malformedLines < maxJSONLDiagnostics {
+				l.malformedLines++
+			}
+			continue
+		}
+		ledger.Record(step)
+	}
+	l.offset += int64(len(complete))
 	return nil
 }

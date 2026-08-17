@@ -3,6 +3,7 @@ package squads
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -11,15 +12,37 @@ import (
 
 	"github.com/embention/agent-squad-go/pkg/observability"
 	"github.com/embention/agent-squad-go/pkg/synapse"
+	"github.com/google/uuid"
 )
 
 // This file contains agent-side behavior: local tool execution, delegation,
 // reasoning loop orchestration, and transversal task processing.
 
+// LLMResponse contains an LLM response and the token usage reported by its provider.
+type LLMResponse struct {
+	Content          string
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	Provider         string
+	RequestID        string
+	GenerationID     string
+	FinishReason     string
+	CostUSD          float64
+	ReasoningTokens  int
+}
+
 // LLMCall is the function signature for invoking an LLM. It mirrors the Python
 // llm_call contract: it receives a model name, system prompt, and a slice of
-// message payloads, and returns a response map with content and token counts.
-type LLMCall func(ctx context.Context, model, systemPrompt string, messages []map[string]any) (map[string]any, error)
+// message payloads, and returns the response content and token counts.
+type LLMCall func(ctx context.Context, model, systemPrompt string, messages []map[string]any) (LLMResponse, error)
+
+type pendingReply struct {
+	OriginalThread  string
+	RespondThreadID string
+	TaskType        string
+	Parameters      map[string]any
+}
 
 // CrossAgentTool represents a tool that delegates tasks to other agents/squads.
 type CrossAgentTool struct {
@@ -60,12 +83,12 @@ type BaseAgent struct {
 	AgentID    string
 	Blackboard BlackboardBus
 	SquadID    string
-	Clock      func() float64
+	Clock      func() time.Time
 }
 
-// NewBaseAgent creates a BaseAgent with a monotonic elapsed-time clock.
+// NewBaseAgent creates a BaseAgent with a wall-clock source that retains Go's monotonic component.
 func NewBaseAgent(agentID string, bb BlackboardBus, squadID string) BaseAgent {
-	return BaseAgent{AgentID: agentID, Blackboard: bb, SquadID: squadID, Clock: timeMonotonic}
+	return BaseAgent{AgentID: agentID, Blackboard: bb, SquadID: squadID, Clock: time.Now}
 }
 
 // SendContextMessage posts a ContextMessage to the blackboard.
@@ -85,13 +108,13 @@ func (b *BaseAgent) SendContextMessage(ctx context.Context, threadID, content st
 			FinishedAt: stepTime,
 		})
 	}
-	msg := synapse.NewContextMessage(threadID, b.AgentID, role, content, squadID, citations, 3600)
+	msg := synapse.NewContextMessage(threadID, b.AgentID, role, content, squadID, citations, time.Hour)
 	return b.Blackboard.SendMessage(ctx, msg)
 }
 
 // SendTaskMessage posts a TaskMessage to the blackboard.
 func (b *BaseAgent) SendTaskMessage(ctx context.Context, threadID, taskType, replyToThread string, parameters map[string]any, squadID string, maxConsumers int) (*synapse.SynapseMessage, error) {
-	msg := synapse.NewTaskMessage(threadID, b.AgentID, taskType, replyToThread, parameters, squadID, 3600, maxConsumers)
+	msg := synapse.NewTaskMessage(threadID, b.AgentID, taskType, replyToThread, parameters, squadID, time.Hour, maxConsumers)
 	return b.Blackboard.SendMessage(ctx, msg)
 }
 
@@ -121,7 +144,7 @@ type SubAgent struct {
 	PreRunHooks       []PreRunHook
 
 	mu                 sync.Mutex
-	PendingReplies     map[string]map[string]any
+	PendingReplies     map[string]pendingReply
 	CrossAgentToolsMap map[string]CrossAgentTool
 	PythonToolsMap     map[string]LocalTool
 	Tools              []string
@@ -135,7 +158,7 @@ func NewSubAgent(agentID, agentType, description, systemPrompt string, bb Blackb
 		Description:        description,
 		SystemPrompt:       systemPrompt,
 		ToolMaxRetry:       3,
-		PendingReplies:     make(map[string]map[string]any),
+		PendingReplies:     make(map[string]pendingReply),
 		CrossAgentToolsMap: make(map[string]CrossAgentTool),
 		PythonToolsMap:     make(map[string]LocalTool),
 		TopologyManifesto:  make(map[string]any),
@@ -149,6 +172,8 @@ func (a *SubAgent) RegisterPreRunHook(hook PreRunHook) {
 
 // UpdateTopology injects awareness of other agents and transversals.
 func (a *SubAgent) UpdateTopology(manifesto map[string]any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.TopologyManifesto = manifesto
 }
 
@@ -248,6 +273,9 @@ func (a *SubAgent) Delegate(ctx context.Context, threadID, taskType, replyToThre
 		}
 	}
 
+	if replyToThread == "" || replyToThread == threadID {
+		replyToThread = "thread-reply-" + uuid.NewString()
+	}
 	a.Blackboard.ParentThreads().Set(replyToThread, threadID)
 
 	metrics := a.Blackboard.GetMetrics(threadID)
@@ -305,22 +333,23 @@ func (a *SubAgent) CallToolDelegate(ctx context.Context, threadID, taskType, rep
 	}
 
 	a.mu.Lock()
-	a.PendingReplies[replyToThread] = map[string]any{
-		"original_thread":   threadID,
-		"respond_thread_id": respondThreadID,
-		"task_type":         taskType,
-		"parameters":        parameters,
+	a.PendingReplies[replyToThread] = pendingReply{
+		OriginalThread:  threadID,
+		RespondThreadID: respondThreadID,
+		TaskType:        taskType,
+		Parameters:      parameters,
 	}
 	a.mu.Unlock()
 
 	return a.SendTaskMessage(ctx, threadID, taskType, replyToThread, parameters, squadID, 1)
 }
 
-// ExecuteInstrumented wraps Execute with telemetry tracking.
-func (a *SubAgent) ExecuteInstrumented(ctx context.Context, threadID string, triggerMsg *synapse.SynapseMessage, respondThreadID string) {
+// ExecuteInstrumented wraps Execute with telemetry tracking and returns its error
+// so the squad can preserve a partial failure without interrupting siblings.
+func (a *SubAgent) ExecuteInstrumented(ctx context.Context, threadID string, triggerMsg *synapse.SynapseMessage, respondThreadID string) error {
 	if triggerMsg != nil && triggerMsg.MessageClass == synapse.ClassTaskMessage {
 		if a.isExcludedTask(triggerMsg.TaskType()) {
-			return
+			return nil
 		}
 	}
 	ctx, span := startObservedSpan(ctx, a.Blackboard, "agent.execute",
@@ -347,13 +376,16 @@ func (a *SubAgent) ExecuteInstrumented(ctx context.Context, threadID string, tri
 	}
 	start := a.Clock()
 	defer func() {
-		elapsed := a.Clock() - start
+		elapsed := a.Clock().Sub(start)
 		if metrics != nil {
 			metrics.RecordSubagentEnd(a.SquadID, a.AgentID, elapsed)
 		}
 	}()
 	if err := a.Execute(ctx, threadID, triggerMsg, respondThreadID); err != nil {
 		span.RecordError(err)
+		if metrics != nil {
+			metrics.RecordError(a.SquadID, a.AgentID, "agent")
+		}
 		stepTime := time.Now()
 		_, _ = recordObservedStep(ctx, a.Blackboard, observability.AgentStep{
 			Kind:       observability.StepError,
@@ -366,14 +398,9 @@ func (a *SubAgent) ExecuteInstrumented(ctx context.Context, threadID string, tri
 			StartedAt:  stepTime,
 			FinishedAt: stepTime,
 		})
-		observedLogger(ctx, a.Blackboard).Error("agent execution failed",
-			"agent_id", a.AgentID,
-			"agent_type", a.AgentType,
-			"squad_id", a.SquadID,
-			"thread_id", threadID,
-			"error", err,
-		)
+		return err
 	}
+	return nil
 }
 
 // Execute is the adaptor that extracts the query from the trigger message and
@@ -446,7 +473,7 @@ func (a *SubAgent) RunReasoningLoop(ctx context.Context, threadID, userQuery, re
 		return err
 	}
 
-	content, _ := res["content"].(string)
+	content := res.Content
 	toolCall := parseToolCall(content)
 
 	if toolCall != nil {
@@ -490,8 +517,8 @@ func (a *SubAgent) RunReasoningLoop(ctx context.Context, threadID, userQuery, re
 			if err != nil {
 				return err
 			}
-			finalContent, _ := finalRes["content"].(string)
-			_, _ = a.Respond(ctx, respondThreadID, finalContent, nil)
+			finalContent := finalRes.Content
+			a.respondObserved(ctx, respondThreadID, finalContent)
 		} else if isCross {
 			queryVal := userQuery
 			if q, ok := arguments["query"].(string); ok {
@@ -504,12 +531,27 @@ func (a *SubAgent) RunReasoningLoop(ctx context.Context, threadID, userQuery, re
 			_, err := a.Delegate(ctx, threadID, crossTool.TaskType, threadID+crossTool.ReplyThreadSuffix, params, crossTool.SquadID, respondThreadID)
 			return err
 		} else {
-			_, _ = a.Respond(ctx, respondThreadID, fmt.Sprintf("Error: Tool '%s' is not registered.", toolName), nil)
+			a.respondObserved(ctx, respondThreadID, fmt.Sprintf("Error: Tool '%s' is not registered.", toolName))
 		}
 	} else {
-		_, _ = a.Respond(ctx, respondThreadID, content, nil)
+		a.respondObserved(ctx, respondThreadID, content)
 	}
 	return nil
+}
+
+// respondObserved publishes an assistant reply and reports delivery failures.
+// The caller cannot recover from them, but a silently dropped reply would leave
+// the requesting thread waiting until its timeout with no trace of the cause.
+func (a *SubAgent) respondObserved(ctx context.Context, threadID, content string) {
+	if _, err := a.Respond(ctx, threadID, content, nil); err != nil {
+		observedLogger(ctx, a.Blackboard).Error("agent response delivery failed",
+			"agent_id", a.AgentID,
+			"agent_type", a.AgentType,
+			"squad_id", a.SquadID,
+			"thread_id", threadID,
+			"error", err,
+		)
+	}
 }
 
 // HandleReply is called when a delegated task returns a response.
@@ -524,7 +566,7 @@ func (a *SubAgent) HandleReply(ctx context.Context, replyThreadID string, replyM
 		return
 	}
 
-	origThread, _ := resumptionCtx["original_thread"].(string)
+	origThread := resumptionCtx.OriginalThread
 	if origThread == "" && replyMsg != nil {
 		origThread = replyMsg.ThreadID
 	}
@@ -545,13 +587,18 @@ func (a *SubAgent) HandleReply(ctx context.Context, replyThreadID string, replyM
 	})
 	start := a.Clock()
 	defer func() {
-		elapsed := a.Clock() - start
+		elapsed := a.Clock().Sub(start)
 		if metrics != nil {
 			metrics.AddSubagentElapsedTime(a.SquadID, a.AgentID, elapsed)
 		}
 	}()
 	if a.ResumeFn != nil {
-		if err := a.ResumeFn(ctx, replyThreadID, replyMsg, resumptionCtx); err != nil {
+		if err := a.ResumeFn(ctx, replyThreadID, replyMsg, map[string]any{
+			"original_thread":   resumptionCtx.OriginalThread,
+			"respond_thread_id": resumptionCtx.RespondThreadID,
+			"task_type":         resumptionCtx.TaskType,
+			"parameters":        resumptionCtx.Parameters,
+		}); err != nil {
 			observedLogger(ctx, a.Blackboard).Error("agent resume failed",
 				"agent_id", a.AgentID,
 				"agent_type", a.AgentType,
@@ -562,12 +609,12 @@ func (a *SubAgent) HandleReply(ctx context.Context, replyThreadID string, replyM
 		}
 		return
 	}
-	respondThreadID, _ := resumptionCtx["respond_thread_id"].(string)
+	respondThreadID := resumptionCtx.RespondThreadID
 	if respondThreadID == "" {
 		respondThreadID = origThread
 	}
 	if replyMsg != nil {
-		_, _ = a.Respond(ctx, respondThreadID, replyMsg.Content(), nil)
+		a.respondObserved(ctx, respondThreadID, replyMsg.Content())
 	}
 }
 
@@ -603,35 +650,73 @@ func (a *SubAgent) injectToolDefinitions(systemPrompt string) string {
 	return systemPrompt + instructions
 }
 
+// ToolExecutionError reports a local tool that could not be executed successfully.
+// It carries the number of attempts made so the caller can render one single
+// representation of the failure instead of encoding it as a result string.
+type ToolExecutionError struct {
+	Tool     string
+	Attempts int
+	Err      error
+}
+
+func (e *ToolExecutionError) Error() string {
+	return fmt.Sprintf("tool %q failed after %d attempt(s): %v", e.Tool, e.Attempts, e.Err)
+}
+
+func (e *ToolExecutionError) Unwrap() error { return e.Err }
+
 func (a *SubAgent) executeToolWithHealing(ctx context.Context, threadID, toolName string, args map[string]any) (string, error) {
-	retries := 0
+	if a.ToolMaxRetry < 1 {
+		return "", fmt.Errorf("tool %q cannot run: ToolMaxRetry must be at least 1", toolName)
+	}
+
 	currentArgs := args
-	for retries < a.ToolMaxRetry {
+	var lastErr error
+	for attempt := 1; attempt <= a.ToolMaxRetry; attempt++ {
 		a.mu.Lock()
 		tool, ok := a.PythonToolsMap[toolName]
 		a.mu.Unlock()
 		if !ok {
-			return "", fmt.Errorf("tool '%s' is not registered", toolName)
+			return "", fmt.Errorf("tool %q is not registered", toolName)
 		}
+
 		result, err := tool.Func(currentArgs)
 		if err == nil {
 			return fmt.Sprintf("%v", result), nil
 		}
-		retries++
-		errorMsg := fmt.Sprintf("Exception executing '%s' with arguments %v: %v", toolName, currentArgs, err)
-		if retries >= a.ToolMaxRetry {
-			return fmt.Sprintf("Failed execution after %d attempts. Last error: %s", a.ToolMaxRetry, errorMsg), nil
+		lastErr = err
+		if attempt == a.ToolMaxRetry {
+			break
 		}
+		metrics := a.Blackboard.GetMetrics(threadID)
+		if metrics != nil {
+			metrics.RecordRetry(a.SquadID, a.AgentID, toolName)
+		}
+
+		errorMsg := fmt.Sprintf("Exception executing '%s' with arguments %v: %v", toolName, currentArgs, err)
 		healed, healErr := a.askLLMToHeal(ctx, threadID, toolName, tool.Schema, errorMsg, currentArgs)
 		if healErr != nil {
-			return "", healErr
+			// Healing failed, so retrying would replay the same arguments.
+			if metrics != nil {
+				metrics.RecordError(a.SquadID, a.AgentID, "tool")
+			}
+			return "", &ToolExecutionError{Tool: toolName, Attempts: attempt, Err: errors.Join(err, healErr)}
 		}
 		currentArgs = healed
 	}
-	return "", fmt.Errorf("tool '%s' failed after %d retries", toolName, a.ToolMaxRetry)
+
+	metrics := a.Blackboard.GetMetrics(threadID)
+	if metrics != nil {
+		metrics.RecordError(a.SquadID, a.AgentID, "tool")
+	}
+	return "", &ToolExecutionError{Tool: toolName, Attempts: a.ToolMaxRetry, Err: lastErr}
 }
 
 func (a *SubAgent) askLLMToHeal(ctx context.Context, threadID, toolName string, schema ToolSchema, errorMsg string, failedArgs map[string]any) (map[string]any, error) {
+	if a.LLMCall == nil {
+		return nil, fmt.Errorf("heal tool %q arguments: no LLM is configured", toolName)
+	}
+
 	healPrompt := fmt.Sprintf(
 		"You are a tool arguments correction helper.\n"+
 			"The tool '%s' failed to execute.\n"+
@@ -642,25 +727,25 @@ func (a *SubAgent) askLLMToHeal(ctx context.Context, threadID, toolName string, 
 			"```json\n{\n  \"arg1\": \"corrected_value\"\n}\n```", toolName, schema, failedArgs, errorMsg)
 	start := a.Clock()
 	res, err := a.LLMCall(ctx, a.Model, healPrompt, nil)
-	elapsed := a.Clock() - start
+	elapsed := a.Clock().Sub(start)
 	metrics := a.Blackboard.GetMetrics(threadID)
 	if metrics != nil {
-		metrics.RecordLLMUsage(a.SquadID, a.AgentID, getInt(res, "prompt_tokens"), getInt(res, "completion_tokens"), getInt(res, "total_tokens"), elapsed)
+		metrics.RecordLLMUsage(a.SquadID, a.AgentID, res.PromptTokens, res.CompletionTokens, res.TotalTokens, elapsed)
 	}
 	if err != nil {
-		return failedArgs, nil
+		return nil, fmt.Errorf("heal tool %q arguments: %w", toolName, err)
 	}
-	content, _ := res["content"].(string)
+	content := res.Content
 	corrected := parseToolCall(content)
 	if m, ok := corrected["arguments"].(map[string]any); ok {
 		return m, nil
 	}
-	return failedArgs, nil
+	return nil, fmt.Errorf("heal tool %q arguments: model returned no corrected arguments", toolName)
 }
 
-func (a *SubAgent) callLLMObserved(ctx context.Context, threadID, systemPrompt string, messages []map[string]any) (map[string]any, error) {
+func (a *SubAgent) callLLMObserved(ctx context.Context, threadID, systemPrompt string, messages []map[string]any) (LLMResponse, error) {
 	if a.LLMCall == nil {
-		return nil, nil
+		return LLMResponse{}, nil
 	}
 	llmCtx, span := startObservedSpan(ctx, a.Blackboard, "agent.llm",
 		observability.Attr{Key: observability.AttrAgentID, Value: a.AgentID},
@@ -672,11 +757,11 @@ func (a *SubAgent) callLLMObserved(ctx context.Context, threadID, systemPrompt s
 	startedAt := time.Now()
 	clockStart := a.Clock()
 	res, err := a.LLMCall(llmCtx, a.Model, systemPrompt, messages)
-	clockElapsed := a.Clock() - clockStart
+	clockElapsed := a.Clock().Sub(clockStart)
 	finishedAt := time.Now()
 	metrics := a.Blackboard.GetMetrics(threadID)
 	if metrics != nil {
-		metrics.RecordLLMUsage(a.SquadID, a.AgentID, getInt(res, "prompt_tokens"), getInt(res, "completion_tokens"), getInt(res, "total_tokens"), clockElapsed)
+		metrics.RecordLLMUsage(a.SquadID, a.AgentID, res.PromptTokens, res.CompletionTokens, res.TotalTokens, clockElapsed)
 	}
 	step := observability.AgentStep{
 		Kind:       observability.StepLLMCall,
@@ -686,10 +771,11 @@ func (a *SubAgent) callLLMObserved(ctx context.Context, threadID, systemPrompt s
 		ThreadID:   threadID,
 		Summary:    "llm call",
 		Model:      a.Model,
-		TokensIn:   getInt(res, "prompt_tokens"),
-		TokensOut:  getInt(res, "completion_tokens"),
+		TokensIn:   res.PromptTokens,
+		TokensOut:  res.CompletionTokens,
 		StartedAt:  startedAt,
 		FinishedAt: finishedAt,
+		LLMTrace:   captureLLMTrace(a.Blackboard, systemPrompt, messages, res),
 	}
 	if err != nil {
 		span.RecordError(err)
@@ -740,11 +826,12 @@ func (t *TransversalAgent) ProcessTask(ctx context.Context, taskMsg *synapse.Syn
 	metrics := t.Blackboard.GetMetrics(threadID)
 	if metrics != nil {
 		metrics.RecordTransversalStart(t.AgentID)
+		metrics.RecordTaskStarted(taskMsg.TaskType())
 	}
-	start := nowSec()
+	start := t.Clock()
 	success := false
 	defer func() {
-		elapsed := nowSec() - start
+		elapsed := t.Clock().Sub(start)
 		if metrics != nil {
 			if success {
 				metrics.RecordTransversalSuccess(t.AgentID, elapsed)
@@ -757,6 +844,10 @@ func (t *TransversalAgent) ProcessTask(ctx context.Context, taskMsg *synapse.Syn
 	result, err := t.ExecuteTask(ctx, taskMsg)
 	if err != nil {
 		span.RecordError(err)
+		if metrics != nil {
+			metrics.RecordTaskFailed(taskMsg.TaskType())
+			metrics.RecordError("", "", "transversal")
+		}
 		errTime := time.Now()
 		_, _ = recordObservedStep(ctx, t.Blackboard, observability.AgentStep{
 			Kind:       observability.StepError,
@@ -772,6 +863,9 @@ func (t *TransversalAgent) ProcessTask(ctx context.Context, taskMsg *synapse.Syn
 		return
 	}
 	success = true
+	if metrics != nil {
+		metrics.RecordTaskCompleted(taskMsg.TaskType())
+	}
 	_, _ = t.SendContextMessage(ctx, taskMsg.ReplyToThread(), result, synapse.RoleAssistant, nil, "")
 }
 
@@ -822,23 +916,6 @@ func stripJSONBlocks(text string) string {
 	return strings.TrimSpace(out)
 }
 
-func getInt(m map[string]any, key string) int {
-	if v, ok := m[key]; ok {
-		switch n := v.(type) {
-		case int:
-			return n
-		case int64:
-			return int(n)
-		case float64:
-			return int(n)
-		case json.Number:
-			i, _ := n.Int64()
-			return int(i)
-		}
-	}
-	return 0
-}
-
 // FetchSlicedContext retrieves context messages sliced from the latest synthesis
 // checkpoint onwards.
 func FetchSlicedContext(ctx context.Context, bb BlackboardBus, threadID string, limit int) ([]synapse.SynapseMessage, error) {
@@ -853,7 +930,7 @@ func FetchSlicedContext(ctx context.Context, bb BlackboardBus, threadID string, 
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg := messages[i]
 		if msg.Role == synapse.RoleSystem {
-			if isSynth, ok := msg.Payload["is_synthesis"].(bool); ok && isSynth {
+			if isSynth, ok := msg.GetPayloadValue("is_synthesis"); ok && isSynth == true {
 				synthesisIdx = i
 				break
 			}
@@ -869,11 +946,4 @@ func FetchSlicedContext(ctx context.Context, bb BlackboardBus, threadID string, 
 func (a *SubAgent) LogSystemContext(ctx context.Context, threadID, content string) error {
 	_, err := a.SendContextMessage(ctx, threadID, content, synapse.RoleSystem, nil, "")
 	return err
-}
-
-var monotonicClockStart = time.Now()
-
-// timeMonotonic returns elapsed seconds using Go's monotonic time component.
-func timeMonotonic() float64 {
-	return time.Since(monotonicClockStart).Seconds()
 }

@@ -53,6 +53,48 @@ agent-squad-go/
 └── README.md
 ```
 
+## Code Functionality Map
+
+The following map connects the user-facing capabilities with the Go packages that implement them.
+
+```mermaid
+flowchart TB
+	Config["pkg/config\nViper configuration"] --> Demo["cmd/squad-demo\nApplication wiring"]
+	Config --> Standalone["cmd/squad-dashboard\nStandalone trace viewer"]
+	Demo --> Runtime["pkg/squads/runtime.go\nProvider-neutral Runtime"]
+	Runtime --> Pipeline["pkg/squads/pipeline.go\nRouting, lifecycle, quiescence"]
+	Pipeline --> Squad["pkg/squads/squad.go\nConcurrent squad coordination"]
+	Squad --> Agent["pkg/squads/agent.go\nLLM, tools, delegation"]
+	Pipeline --> Blackboard["pkg/squads/blackboard.go\nSynapse adapter"]
+	Blackboard --> Synapse["pkg/synapse\nMessages, storage, events, TTL"]
+	Pipeline -. trace context .-> Observability["pkg/observability\nSpans, steps, metrics, logs"]
+	Agent -. trace context .-> Observability
+	Synapse -. persisted metadata .-> Observability
+	Observability --> Export["JSONL export/replay\nOptional OpenTelemetry"]
+	Observability --> Dashboard["pkg/dashboard\nREST, SSE, graph, UI"]
+	Standalone --> Dashboard
+	Dashboard --> Tests["tests/\nBehavior and concurrency regressions"]
+```
+
+| Capability | Main implementation | What it provides | Validation |
+| --- | --- | --- | --- |
+| Application configuration | `pkg/config/config.go` | Viper-backed flags, environment variables, defaults, and fail-fast validation. | `tests` and `pkg/config/config_test.go` |
+| Declarative runtime | `pkg/squads/runtime.go` | Registers squads and agents, resolves provider callbacks, owns lifecycle, and exposes observability. | `tests/squads` |
+| Query orchestration | `pkg/squads/pipeline.go` | Routes queries, starts concurrent work, enforces timeout and iteration limits, waits for quiescence, and assembles `QueryResult`. | `tests/squads` |
+| Squad and agent execution | `pkg/squads/squad.go`, `pkg/squads/agent.go` | Runs agents, LLM calls, local tools, healing retries, transversal tasks, and cross-squad delegation. | `tests/squads` |
+| Blackboard messaging | `pkg/synapse/engine.go`, `models.go` | Stores context, task, and command messages with atomic task consumption, TTL cleanup, and trace metadata. | `tests/synapse` |
+| Event-driven integration | `pkg/synapse/events.go`, `pkg/squads/observer.go` | Dispatches typed pre-insert and post-insert hooks to squads, observers, and transversal agents. | `tests/synapse`, `tests/squads` |
+| Persistence boundary | `pkg/synapse/storage.go` | Keeps the engine independent from storage implementations and provides thread-safe in-memory storage. | `tests/synapse` |
+| Execution metrics | `pkg/squads/metrics.go` | Tracks lifecycle, LLM usage, delegation, retries, task outcomes, and categorized errors. | `tests/squads` |
+| Trace reconstruction | `pkg/observability/context.go`, `pkg/squads/telemetry.go` | Propagates correlation, trace, span, causation, step, and parent-thread metadata across asynchronous work. | `tests/squads`, `tests/synapse` |
+| Business-level observability | `pkg/observability/step.go`, `hub.go`, `logger.go` | Records bounded timelines, correlated logs, live events, subscriber health, and dropped SSE events. | `tests/observability`, `tests/dashboard` |
+| Trace export and replay | `pkg/observability/exporter.go` | Writes JSONL traces and incrementally replays complete records without duplicating steps. | `tests/observability`, `tests/dashboard` |
+| External telemetry | `pkg/observability/tracer.go`, `otel_runtime.go` | Supplies noop, recorder, and optional OpenTelemetry tracing implementations. | `tests/observability` |
+| Dashboard projections | `pkg/dashboard/api.go`, `graph.go`, `sse.go` | Serves query timelines, workflow graphs, metrics, embedded assets, and live `AgentStep` events. | `tests/dashboard` |
+| Dashboard frontend | `pkg/dashboard/web/` | Renders the workflow graph, query drawer, timeline, metrics, logs, and inspector from read-only projections. | `node --check pkg/dashboard/web/app.js` |
+| End-to-end demo | `cmd/squad-demo/main.go` | Demonstrates provider-neutral wiring with optional dashboard, JSONL, and OpenTelemetry integrations. | `go run ./cmd/squad-demo/` |
+| Local workflow experiment | `local-tests/company-ai-impact/` | Exercises a larger declarative multi-phase workflow without adding application-specific behavior to core packages. | Nested module tests and mock run |
+
 ## Package Responsibilities
 
 ### `pkg/synapse`
@@ -85,7 +127,7 @@ Observability captures both infrastructure spans and human-readable business ste
 - `tracer.go`: local `Tracer`/`Span` contracts, noop tracer, recorder tracer for tests, and OpenTelemetry adapter.
 - `otel_runtime.go`: OTLP gRPC provider/exporter setup driven by `SQUAD_OTEL_*` configuration.
 - `step.go`: `AgentStep`, step kinds, `StepLedger`, query summaries, deduplication, and live hub broadcast.
-- `hub.go`: non-blocking pub/sub for live dashboard updates.
+- `hub.go`: bounded, non-blocking pub/sub for live dashboard updates, with subscriber and dropped-event statistics.
 - `exporter.go`: stdout and JSONL export/import for replayable traces.
 - `context.go`: trace and step IDs carried through `context.Context`.
 - `logger.go`: `slog` enrichment with `trace_id`, `span_id`, `correlation_id`, `causation_id`, and `step_id`.
@@ -115,9 +157,77 @@ The dashboard exposes observability data for humans.
 9. The final synthesizer produces the response.
 10. Metrics, timeline steps, logs, JSONL traces, dashboard data, and optional OTel spans are available for inspection.
 
+Every persisted message carries correlation, trace, span, and causation metadata. Child threads retain
+their parent-thread link, and asynchronous handlers rebuild the same context before recording steps.
+The root query remains non-terminal until its execution tree reaches quiescence and the pipeline records
+the root `responded` step.
+
 ## Integration Guide
 
-An application integrates the framework by assembling four layers:
+For most applications, define the squads and agents declaratively. `Runtime` owns the Synapse
+service, blackboard, and pipeline lifecycle; the application owns its provider-neutral `LLMCall`,
+agent prompts, routing, and final synthesis policy. The minimum required declaration is one
+runtime-level `LLMCall`, one squad ID, and one agent ID plus system prompt. Names, descriptions,
+types, models, and per-agent overrides are optional metadata or policy controls.
+
+```go
+runtime, err := squads.NewRuntime(ctx, squads.RuntimeConfig{
+	LLMCall: llmCall,
+	Squads: []squads.SquadDefinition{
+		{
+			ID:          "research",
+			Agents: []squads.AgentDefinition{
+				{
+					ID:           "researcher",
+					SystemPrompt: "Return concise findings with direct sources.",
+				},
+			},
+		},
+	},
+})
+if err != nil {
+	return err
+}
+defer runtime.Close()
+
+result, err := runtime.Query(ctx, "conversation-01", []string{"research"}, userQuery, 10*time.Second)
+```
+
+Add `FinalSynthesizer` when the application needs a composed final response on the root
+thread. Pass explicit initial squad IDs as above for the smallest setup; provide
+`RouteQueryFn` only when the runtime must choose squads dynamically.
+
+`Runtime` validates that every squad has agents, every agent has an ID and system prompt, agent
+IDs and squad IDs are unique, and every agent resolves an `LLMCall` from its own definition, its
+squad, or the runtime default. Per-agent `Model`, `LLMCall`, and exclusion lists override the
+runtime defaults when a workflow needs a different provider or delegation policy. Use
+`runtime.Observability()` as the source for the embedded dashboard and `runtime.Close()` during
+application shutdown.
+
+### Optional LLM audit payloads
+
+The dashboard always records observable lifecycle events such as agent starts, LLM calls, tool
+calls, delegations, responses, errors, timing, and token totals. To retain the exact system prompt,
+prompt messages, model completion, and provider metadata for each LLM call, explicitly enable
+`RuntimeConfig.CaptureLLMContent`. It is disabled by default because the step ledger, JSONL
+exporters, SSE stream, and dashboard can then expose sensitive user and system context.
+
+Captured audit payloads contain only application-visible request and response data. They do not
+contain, request, infer, or present private model chain-of-thought. Restrict dashboard access and
+trace retention according to the sensitivity of the prompts and completions.
+
+### Reading the execution graph
+
+Graph lines represent observed orchestration events, not an assumption that every agent talks directly
+to every other agent. `route` means a query phase selected a squad, `runs` means that squad assigned an
+agent, `result` means an agent published its output back to its squad, and `summary` means the squad
+coordinator published its combined output to the query phase. Tool and cross-agent delegation events
+appear only when the workflow actually invokes them. Selecting an agent or squad node opens an inspector
+that states the observed coordination pattern and lists its events. A `running` status is based on the
+last observable lifecycle state; a squad becomes `done` when its own coordinator synthesis is recorded.
+
+The lower-level assembly remains available for advanced integrations that need direct control of
+Synapse, custom observer registration, or incremental component construction:
 
 1. Create a `SynapseService` and wrap it with `NewSynapseBlackboardBus`.
 2. Create a `SquadsPipeline` with a final synthesizer.
@@ -126,7 +236,7 @@ An application integrates the framework by assembling four layers:
 
 The minimum application-owned contracts are:
 
-- `squads.LLMCall`: receives `context.Context`, model name, system prompt, and chat messages. It returns a map containing at least `content`; token fields (`prompt_tokens`, `completion_tokens`, and `total_tokens`) are optional and used for metrics when present.
+- `squads.LLMCall`: receives `context.Context`, model name, system prompt, and chat messages. It returns a `squads.LLMResponse`; populate `Content` with the model response and the token fields when the provider reports them.
 - `squads.FinalSynthesizer`: receives the completed execution context through the application implementation and exposes the final response through `LastSynthesizedContent`.
 - `squads.TransversalAgent.ExecuteTask`: receives a `SynapseMessage` and returns the delegated task result.
 - `squads.LocalTool.Func`: receives a `map[string]any` of arguments and returns a result or error.
@@ -161,14 +271,14 @@ researchSquad.RegisterSubAgent(agent)
 researchSquad.LLMCall = llmCall
 pipeline.RegisterSquad(researchSquad)
 
-pipeline.RouteQueryFn = func(ctx context.Context, content string) (any, error) {
-		return "research", nil
+pipeline.RouteQueryFn = func(ctx context.Context, content string) ([]string, error) {
+		return []string{"research"}, nil
 }
 
-result, err := pipeline.Query(ctx, "conversation-01", nil, userQuery, 10)
+result, err := pipeline.Query(ctx, "conversation-01", nil, userQuery, 10*time.Second)
 ```
 
-`initialSquadID` may be a single squad ID or a collection of IDs. When it is `nil`, `Query` calls `RouteQueryFn`; a missing route function is an application configuration error. If `threadID` is empty, the pipeline generates one. A non-positive timeout uses the default of 10 seconds, and a non-positive `maxIterations` uses the default of 15.
+`initialSquadIDs` is a `[]string`: select one squad with `[]string{"research"}` or multiple squads with `[]string{"research", "review"}`. When it is `nil`, `Query` calls `RouteQueryFn`; a missing route function is an application configuration error. An empty slice, empty squad ID, or unregistered squad ID fails validation. If `threadID` is empty, the pipeline generates one. `Query` accepts a `time.Duration` timeout; a non-positive value uses the default of `10*time.Second`, and a non-positive `maxIterations` uses the default of 15.
 
 ### Agent Reasoning And Tools
 
@@ -195,7 +305,7 @@ Local tools are registered in `SubAgent.PythonToolsMap` for compatibility with t
 
 ### Synapse Message Model
 
-Synapse is an in-memory blackboard with an optional `BaseStorage` implementation. Every message has an ID, thread, agent, role, TTL, message class, payload, and trace metadata.
+Synapse is an in-memory blackboard with an optional `BaseStorage` implementation. Every message has an ID, thread, agent, role, `time.Time` timestamp, `time.Duration` TTL, message class, payload, and trace metadata.
 
 | Message | Purpose | Main payload fields |
 | --- | --- | --- |
@@ -222,6 +332,7 @@ The query thread ID is also the default correlation ID. Child threads are linked
 
 - The dashboard graph is observational only; it does not control execution depth.
 - `SquadsPipeline` prevents unbounded execution with `MaxIterations` and query timeout.
+- `Query` derives a child context from the caller and its timeout; caller cancellation and deadline expiration are propagated to agents, tools, delegations, and synthesizers.
 - Quiescence is calculated by resolving the root thread, collecting all child threads, and checking active executions plus pending replies.
 - Task consumption in Synapse is atomic under a mutex so two workers cannot consume the same task concurrently.
 
@@ -291,19 +402,48 @@ Standalone dashboard:
 go run ./cmd/squad-dashboard --addr 127.0.0.1:8080 --trace-file ./traces/agent-steps.jsonl
 ```
 
-The standalone dashboard tails the JSONL file incrementally and deduplicates steps by `step_id`, so you can refresh or reopen the UI without duplicating the visual timeline.
+The standalone dashboard tails the JSONL file incrementally and deduplicates steps by `step_id`, so you can refresh or reopen the UI without duplicating the visual timeline. It only replays
+newline-terminated records, preserving its byte offset when a writer is in the middle of appending a
+record. Malformed complete lines are skipped and counted in loader diagnostics.
 
 ## Dashboard API
 
 - `GET /api/queries`: returns query summaries plus metrics.
 - `GET /api/queries/{correlation_id}/timeline`: returns raw `AgentStep` entries.
 - `GET /api/queries/{correlation_id}/graph`: returns graph nodes and edges for visualization.
-- `GET /api/metrics/summary?query={correlation_id}`: returns aggregate duration, token, LLM/tool, agent, and error metrics.
+- `GET /api/metrics/summary?query={correlation_id}`: returns aggregate duration, token, LLM/tool, agent, error, and SSE health metrics.
+- `GET /api/workflow/timeline`: returns the ordered timeline across every retained query.
+- `GET /api/workflow/graph`: returns one graph with a workflow root and phase nodes for every retained query.
+- `GET /api/workflow/metrics`: returns aggregate metrics across every retained query, including SSE health.
 - `GET /api/stream`: opens an SSE stream of live `AgentStep` events.
+
+SSE delivery is intentionally non-blocking so agent execution is never held up by a slow browser. Each
+subscriber has a bounded buffer; events that cannot fit are counted as `sse_dropped_events`. The hub
+also enforces a maximum number of live subscribers and returns HTTP `503` when that limit is reached.
+The standalone command uses explicit request-header, request, idle-connection, and header-size limits and
+shuts down active connections gracefully on process termination. Keep the dashboard on a trusted interface
+or place it behind the application's authentication and network controls; the dashboard itself is read-only,
+not an access-control layer.
 
 The dashboard is read-only: it projects the observability ledger and does not dispatch agents or change execution depth. The embedded mode shares the runtime with the demo process and therefore shows live events immediately. The standalone mode creates its own runtime; it only displays live data when another component writes to that same runtime, or persisted data when `--trace-file` is supplied.
 
+The Queries drawer opens on `Whole workflow` when executions are available. It aggregates all retained query phases in one graph, timeline, and metric set; selecting an individual query preserves the phase-level inspection view.
+
 The JSONL loader tracks its byte offset, ignores malformed lines so replay can continue, resets after file truncation/rotation, and deduplicates steps by `step_id` in the ledger. This makes the standalone dashboard suitable for tailing a file that is still being appended to.
+
+### Browser validation
+
+The repository includes a minimal Playwright harness for the embedded dashboard. Install its
+local dependency and Chromium once, then run the desktop and narrow-viewport smoke flows:
+
+```powershell
+npm install
+npx playwright install chromium
+npm run test:e2e
+```
+
+The test starts `squad-dashboard` with a deterministic JSONL fixture. Set
+`PLAYWRIGHT_BASE_URL` when validating an already running dashboard instead.
 
 ## OpenTelemetry
 
@@ -316,6 +456,19 @@ When enabled, the demo builds an OTLP gRPC tracer provider and adapts it to the 
 ```bash
 go test ./... -v -count=1
 ```
+
+On Windows, the race detector requires cgo and a C compiler. With the Scoop `mingw-nuwen`
+toolchain installed, run it explicitly if the current PowerShell session has not refreshed its
+`PATH`:
+
+```powershell
+$env:CGO_ENABLED = "1"
+$env:CC = "C:\Users\afp5\scoop\apps\mingw-nuwen\current\bin\gcc.exe"
+$env:CXX = "C:\Users\afp5\scoop\apps\mingw-nuwen\current\bin\g++.exe"
+go test -race ./... -count=1
+```
+
+The complete race-enabled suite passes with GCC 15.2.0 in this environment.
 
 Focused suites:
 

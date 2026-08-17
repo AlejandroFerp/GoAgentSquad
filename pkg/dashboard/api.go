@@ -24,7 +24,7 @@ func (s *Server) handleQueries(w http.ResponseWriter, r *http.Request) {
 		timeline := s.obs.Ledger.Timeline(query.CorrelationID)
 		snapshots = append(snapshots, QuerySnapshot{
 			Summary: query,
-			Metrics: BuildMetricsSummary(query.CorrelationID, timeline),
+			Metrics: addHubMetrics(BuildMetricsSummary(query.CorrelationID, timeline), s.obs.Hub),
 		})
 	}
 	writeJSON(w, snapshots)
@@ -56,6 +56,31 @@ func (s *Server) handleQueryResource(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleWorkflowResource(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.syncTraceFile()
+	resource := strings.TrimPrefix(r.URL.Path, "/api/workflow/")
+	if resource == "" || strings.Contains(resource, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	stages := s.workflowStages()
+	timeline := workflowTimeline(stages)
+	switch resource {
+	case "timeline":
+		writeJSON(w, timeline)
+	case "graph":
+		writeJSON(w, BuildWorkflowGraph(stages))
+	case "metrics":
+		writeJSON(w, addHubMetrics(BuildMetricsSummary(WorkflowCorrelationID, timeline), s.obs.Hub))
+	default:
+		http.NotFound(w, r)
+	}
+}
+
 func (s *Server) handleMetricsSummary(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -71,7 +96,39 @@ func (s *Server) handleMetricsSummary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, MetricsSummary{})
 		return
 	}
-	writeJSON(w, BuildMetricsSummary(correlationID, s.obs.Ledger.Timeline(correlationID)))
+	writeJSON(w, addHubMetrics(BuildMetricsSummary(correlationID, s.obs.Ledger.Timeline(correlationID)), s.obs.Hub))
+}
+
+func (s *Server) workflowStages() []WorkflowStage {
+	queries := s.obs.Ledger.Queries()
+	sort.Slice(queries, func(i, j int) bool {
+		if queries[i].StartedAt.Equal(queries[j].StartedAt) {
+			return queries[i].CorrelationID < queries[j].CorrelationID
+		}
+		return queries[i].StartedAt.Before(queries[j].StartedAt)
+	})
+	stages := make([]WorkflowStage, 0, len(queries))
+	for _, query := range queries {
+		stages = append(stages, WorkflowStage{
+			Summary:  query,
+			Timeline: s.obs.Ledger.Timeline(query.CorrelationID),
+		})
+	}
+	return stages
+}
+
+func workflowTimeline(stages []WorkflowStage) []observability.AgentStep {
+	timeline := []observability.AgentStep{}
+	for _, stage := range stages {
+		timeline = append(timeline, stage.Timeline...)
+	}
+	sort.SliceStable(timeline, func(i, j int) bool {
+		if timeline[i].StartedAt.Equal(timeline[j].StartedAt) {
+			return timeline[i].StepID < timeline[j].StepID
+		}
+		return timeline[i].StartedAt.Before(timeline[j].StartedAt)
+	})
+	return timeline
 }
 
 func writeJSON(w http.ResponseWriter, value any) {

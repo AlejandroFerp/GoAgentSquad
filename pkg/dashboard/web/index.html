@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Agent Squad Dashboard</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -12,37 +13,125 @@
         <h1>Agent Squad Dashboard</h1>
         <p>Live graph, timeline, and metrics for each query execution.</p>
       </div>
-      <div class="status" id="stream-status">connecting…</div>
+      <div class="topbar-actions">
+        <nav class="workspace-tabs" aria-label="Dashboard panels">
+          <button type="button" data-drawer-tab="queries" aria-controls="workspace-drawer" aria-expanded="false">
+            Queries <span id="queries-toggle-count">0</span>
+          </button>
+          <button type="button" data-drawer-tab="logs" aria-controls="workspace-drawer" aria-expanded="false">
+            Logs <span id="logs-toggle-count">0</span>
+          </button>
+          <button type="button" data-drawer-tab="inspector" aria-controls="workspace-drawer" aria-expanded="false">Inspector</button>
+        </nav>
+        <div class="stream-status is-connecting" id="stream-status" role="status" aria-live="polite">
+          <span class="stream-dot" aria-hidden="true"></span>
+          <span>
+            <strong id="stream-state">Connecting</strong>
+            <small>Last event <time id="last-event-time">waiting...</time></small>
+          </span>
+        </div>
+      </div>
     </header>
 
-    <main class="layout">
-      <aside class="panel queries-panel">
-        <h2>Queries</h2>
-        <div id="queries" class="query-list"></div>
-      </aside>
+    <section class="activity-bar" id="activity-bar" aria-live="polite">
+      <span class="activity-label">Now</span>
+      <strong id="latest-event">Waiting for agent activity</strong>
+      <span id="latest-context">The stream will update this view automatically.</span>
+    </section>
 
+    <main class="layout" id="dashboard-content">
       <section class="main-panels">
         <section class="cards" id="metrics"></section>
 
         <section class="panel graph-panel">
           <div class="panel-header">
-            <h2>Graph</h2>
-            <span id="selected-query"></span>
+            <div>
+              <h2>Execution graph</h2>
+              <span class="selected-query" id="selected-query"></span>
+            </div>
+            <div class="graph-controls" aria-label="Graph navigation">
+              <button class="icon-button" id="zoom-out" type="button" data-tooltip="Zoom out" aria-label="Zoom out">−</button>
+              <output id="zoom-level" aria-live="polite">100%</output>
+              <button class="icon-button" id="zoom-in" type="button" data-tooltip="Zoom in" aria-label="Zoom in">+</button>
+              <button class="fit-button" id="zoom-fit" type="button" data-tooltip="Reset zoom and scroll position">Fit</button>
+            </div>
           </div>
-          <svg id="graph" viewBox="0 0 1200 560" preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="graph-legend" aria-label="Graph status legend">
+            <span><i class="legend-dot idle"></i>Idle</span>
+            <span><i class="legend-dot running"></i>Running</span>
+            <span><i class="legend-dot done"></i>Done</span>
+            <span><i class="legend-dot error"></i>Error</span>
+            <span class="pan-hint">Scroll to navigate</span>
+          </div>
+          <div class="graph-flow-legend" aria-label="Graph flow legend">
+            <span><i class="legend-line route"></i>Route: phase sends work to a squad</span>
+            <span><i class="legend-line runs"></i>Runs: squad assigns an agent</span>
+            <span><i class="legend-line result"></i>Result: agent publishes to its squad</span>
+            <span><i class="legend-line summary"></i>Summary: coordinator returns output to the phase</span>
+            <span><i class="legend-line completion"></i>Completion: final root event closes the workflow</span>
+          </div>
+          <div class="graph-shape-legend" aria-label="Graph role legend">
+            <span><i class="legend-shape phase"></i>Workflow or phase</span>
+            <span><i class="legend-shape squad"></i>Squad</span>
+            <span><i class="legend-shape coordinator"></i>Coordinator</span>
+            <span><i class="legend-shape agent"></i>Field agent</span>
+            <span><i class="legend-shape tool"></i>Tool or task</span>
+            <span><i class="legend-shape terminal"></i>Workflow completion</span>
+          </div>
+          <div class="graph-viewport" id="graph-viewport" tabindex="0" aria-label="Execution graph. Scroll to navigate and select a node for details.">
+            <p class="empty-state" id="graph-empty">Select a query to view its execution graph.</p>
+            <svg id="graph" viewBox="0 0 1200 560" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Selected query execution graph"></svg>
+          </div>
+          <div class="graph-edge-tooltip" id="graph-edge-tooltip" role="tooltip" hidden></div>
         </section>
 
         <section class="panel timeline-panel">
-          <h2>Timeline</h2>
+          <div class="panel-header">
+            <h2>Timeline</h2>
+            <span class="timeline-state" id="timeline-state">Waiting</span>
+          </div>
           <div id="timeline" class="timeline"></div>
         </section>
       </section>
-
-      <aside class="panel inspector-panel">
-        <h2>Inspector</h2>
-        <pre id="inspector">Select a step or graph node.</pre>
-      </aside>
     </main>
+
+    <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+    <aside class="workspace-drawer" id="workspace-drawer" aria-label="Dashboard details" aria-hidden="true" inert>
+      <header class="drawer-header">
+        <div>
+          <span class="drawer-eyebrow">Workspace</span>
+          <h2 id="drawer-title">Queries</h2>
+        </div>
+        <button class="drawer-close" id="drawer-close" type="button" data-tooltip="Close panel" aria-label="Close panel">&times;</button>
+      </header>
+
+      <nav class="drawer-tabs" role="tablist" aria-label="Dashboard detail views">
+        <button id="drawer-tab-queries" type="button" role="tab" data-drawer-tab="queries" aria-controls="drawer-queries">Queries</button>
+        <button id="drawer-tab-logs" type="button" role="tab" data-drawer-tab="logs" aria-controls="drawer-logs">Logs</button>
+        <button id="drawer-tab-inspector" type="button" role="tab" data-drawer-tab="inspector" aria-controls="drawer-inspector">Inspector</button>
+      </nav>
+
+      <section class="drawer-view" id="drawer-queries" role="tabpanel" aria-labelledby="drawer-tab-queries">
+        <div class="drawer-view-header">
+          <p>Select an execution to focus the dashboard.</p>
+          <span class="count" id="query-count">0</span>
+        </div>
+        <div id="queries" class="query-list"></div>
+      </section>
+
+      <section class="drawer-view logs-view" id="drawer-logs" role="tabpanel" aria-labelledby="drawer-tab-logs" hidden>
+        <div class="drawer-view-header logs-toolbar">
+          <label><input id="follow-logs" type="checkbox" checked /> Follow</label>
+          <button id="clear-logs" type="button">Clear</button>
+        </div>
+        <div id="logs" class="log-list" role="log" aria-live="polite" aria-relevant="additions"></div>
+      </section>
+
+      <section class="drawer-view" id="drawer-inspector" role="tabpanel" aria-labelledby="drawer-tab-inspector" hidden>
+        <p class="inspector-hint">Select a graph node to inspect its observed execution, or a timeline event for its complete payload.</p>
+        <div id="inspector">Nothing selected.</div>
+      </section>
+    </aside>
 
     <script src="/app.js"></script>
   </body>

@@ -24,6 +24,26 @@ const (
 	StepError         StepKind = "error"
 )
 
+// LLMMessage is one normalized message sent to a language model.
+type LLMMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// LLMTrace contains opt-in request, completion, and provider metadata for one LLM call.
+// It deliberately excludes unverified model reasoning content.
+type LLMTrace struct {
+	SystemPrompt    string       `json:"system_prompt"`
+	Messages        []LLMMessage `json:"messages"`
+	Completion      string       `json:"completion"`
+	Provider        string       `json:"provider,omitempty"`
+	RequestID       string       `json:"request_id,omitempty"`
+	GenerationID    string       `json:"generation_id,omitempty"`
+	FinishReason    string       `json:"finish_reason,omitempty"`
+	CostUSD         float64      `json:"cost_usd,omitempty"`
+	ReasoningTokens int          `json:"reasoning_tokens,omitempty"`
+}
+
 // AgentStep is a serializable, business-level record of one observable action.
 type AgentStep struct {
 	StepID        string    `json:"step_id"`
@@ -46,6 +66,7 @@ type AgentStep struct {
 	FinishedAt    time.Time `json:"finished_at,omitempty"`
 	DurationMS    int64     `json:"duration_ms,omitempty"`
 	Error         string    `json:"error,omitempty"`
+	LLMTrace      *LLMTrace `json:"llm_trace,omitempty"`
 }
 
 type QuerySummary struct {
@@ -58,16 +79,33 @@ type QuerySummary struct {
 	StepCount     int       `json:"step_count"`
 }
 
+const DefaultMaxRetainedCorrelations = 200
+
 // StepLedger stores timelines by correlation id. The zero value is usable.
 type StepLedger struct {
-	mu   sync.RWMutex
-	byID map[string][]AgentStep
-	seen map[string]struct{}
-	hub  *Hub
+	mu               sync.RWMutex
+	byID             map[string][]AgentStep
+	seen             map[string]struct{}
+	correlationOrder []string
+	maxCorrelations  int
+	hub              *Hub
 }
 
 func NewStepLedger(hub *Hub) *StepLedger {
-	return &StepLedger{byID: make(map[string][]AgentStep), seen: make(map[string]struct{}), hub: hub}
+	return NewStepLedgerWithLimit(hub, DefaultMaxRetainedCorrelations)
+}
+
+// NewStepLedgerWithLimit creates a ledger retaining at most maxCorrelations timelines.
+func NewStepLedgerWithLimit(hub *Hub, maxCorrelations int) *StepLedger {
+	if maxCorrelations <= 0 {
+		maxCorrelations = DefaultMaxRetainedCorrelations
+	}
+	return &StepLedger{
+		byID:            make(map[string][]AgentStep),
+		seen:            make(map[string]struct{}),
+		maxCorrelations: maxCorrelations,
+		hub:             hub,
+	}
 }
 
 // Record appends one step and broadcasts it to live subscribers.
@@ -95,7 +133,11 @@ func (l *StepLedger) Record(step AgentStep) AgentStep {
 		return step
 	}
 	l.seen[step.StepID] = struct{}{}
+	if _, exists := l.byID[step.CorrelationID]; !exists {
+		l.correlationOrder = append(l.correlationOrder, step.CorrelationID)
+	}
 	l.byID[step.CorrelationID] = append(l.byID[step.CorrelationID], step)
+	l.evictExcessCorrelationsLocked()
 	hub := l.hub
 	l.mu.Unlock()
 
@@ -103,6 +145,49 @@ func (l *StepLedger) Record(step AgentStep) AgentStep {
 		hub.Broadcast(step)
 	}
 	return step
+}
+
+func (l *StepLedger) evictExcessCorrelationsLocked() {
+	maxCorrelations := l.maxCorrelations
+	if maxCorrelations <= 0 {
+		maxCorrelations = DefaultMaxRetainedCorrelations
+	}
+	for len(l.byID) > maxCorrelations {
+		evictionIndex := 0
+		for index, correlationID := range l.correlationOrder {
+			if isTerminalTimeline(l.byID[correlationID]) {
+				evictionIndex = index
+				break
+			}
+		}
+		correlationID := l.correlationOrder[evictionIndex]
+		for _, step := range l.byID[correlationID] {
+			delete(l.seen, step.StepID)
+		}
+		delete(l.byID, correlationID)
+		l.correlationOrder = append(l.correlationOrder[:evictionIndex], l.correlationOrder[evictionIndex+1:]...)
+	}
+}
+
+func isTerminalTimeline(steps []AgentStep) bool {
+	if len(steps) == 0 {
+		return false
+	}
+	return isRootTerminalStep(steps, steps[len(steps)-1])
+}
+
+func isRootTerminalStep(steps []AgentStep, step AgentStep) bool {
+	if step.ThreadID != rootThreadID(steps) {
+		return false
+	}
+	return step.Kind == StepResponded || step.Kind == StepQuiesced || step.Kind == StepError || step.Error != ""
+}
+
+func rootThreadID(steps []AgentStep) string {
+	if len(steps) == 0 {
+		return ""
+	}
+	return steps[0].ThreadID
 }
 
 func (l *StepLedger) Timeline(correlationID string) []AgentStep {
@@ -126,10 +211,10 @@ func (l *StepLedger) Queries() []QuerySummary {
 		first := steps[0]
 		last := steps[len(steps)-1]
 		status := "running"
-		if last.Kind == StepResponded || last.Kind == StepQuiesced {
+		if isRootTerminalStep(steps, last) && (last.Kind == StepResponded || last.Kind == StepQuiesced) {
 			status = "done"
 		}
-		if last.Kind == StepError || last.Error != "" {
+		if isRootTerminalStep(steps, last) && (last.Kind == StepError || last.Error != "") {
 			status = "error"
 		}
 		out = append(out, QuerySummary{

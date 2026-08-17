@@ -1,12 +1,12 @@
 // Package squads implements the declarative multi-agent collaboration framework
-// on top of the synapse blackboard. It is the Go equivalent of the Python
-// agent_squads package, redesigned for safe concurrent execution.
+// Synapse blackboard designed for safe concurrent execution.
 package squads
 
 import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/embention/agent-squad-go/pkg/observability"
 	"github.com/embention/agent-squad-go/pkg/synapse"
@@ -21,18 +21,23 @@ type PipelineMetrics interface {
 	RecordSquadStart(squadID string)
 	RecordSquadEnd(squadID string)
 	RecordSubagentStart(squadID, agentID string)
-	RecordSubagentEnd(squadID, agentID string, elapsed float64)
+	RecordSubagentEnd(squadID, agentID string, elapsed time.Duration)
 	RecordSubagentWaiting(squadID, agentID, replyToThread string)
 	RecordSubagentResumed(squadID, agentID, replyThreadID string)
-	AddSubagentElapsedTime(squadID, agentID string, elapsed float64)
+	AddSubagentElapsedTime(squadID, agentID string, elapsed time.Duration)
 	RecordTransversalStart(agentID string)
-	RecordTransversalSuccess(agentID string, elapsed float64)
-	RecordTransversalFailure(agentID string, elapsed float64)
+	RecordTransversalSuccess(agentID string, elapsed time.Duration)
+	RecordTransversalFailure(agentID string, elapsed time.Duration)
 	RecordObserverInteraction(observerName string)
-	RecordLLMUsage(squadID, agentID string, prompt, completion, total int, elapsed float64)
-	RecordCoordinatorUsage(squadID string, prompt, completion, total int, elapsed float64)
+	RecordLLMUsage(squadID, agentID string, prompt, completion, total int, elapsed time.Duration)
+	RecordCoordinatorUsage(squadID string, prompt, completion, total int, elapsed time.Duration)
 	RecordCrossSquadMessage(fromAgent, toSquad, taskType string, parameters map[string]any)
 	RecordDelegation(source, destination, delegationType string, parameters map[string]any)
+	RecordTaskStarted(taskType string)
+	RecordTaskCompleted(taskType string)
+	RecordTaskFailed(taskType string)
+	RecordRetry(squadID, agentID, operation string)
+	RecordError(squadID, agentID, category string)
 	RegisterSquad(squadID string, squad *Squad)
 	RegisterTransversal(agentID, agentType string)
 	Finalize(status string)
@@ -42,11 +47,12 @@ type PipelineMetrics interface {
 // ObservabilityRuntime groups the optional tracing and timeline components.
 // The zero-value is normalized by ensureDefaults so callers can use it safely.
 type ObservabilityRuntime struct {
-	Tracer   observability.Tracer
-	Hub      *observability.Hub
-	Ledger   *observability.StepLedger
-	Exporter observability.TraceExporter
-	Logger   *slog.Logger
+	Tracer            observability.Tracer
+	Hub               *observability.Hub
+	Ledger            *observability.StepLedger
+	Exporter          observability.TraceExporter
+	Logger            *slog.Logger
+	CaptureLLMContent bool
 }
 
 func NewObservabilityRuntime() *ObservabilityRuntime {
@@ -132,6 +138,37 @@ func (p *ParentThreadMap) Keys() []string {
 	return out
 }
 
+// DeleteTree removes the descendant relationships for rootThread and returns
+// every thread ID that belonged to the removed execution tree, including rootThread.
+func (p *ParentThreadMap) DeleteTree(rootThread string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	threads := map[string]struct{}{rootThread: {}}
+	for changed := true; changed; {
+		changed = false
+		for childThread, parentThread := range p.m {
+			if _, exists := threads[parentThread]; !exists {
+				continue
+			}
+			if _, exists := threads[childThread]; exists {
+				continue
+			}
+			threads[childThread] = struct{}{}
+			changed = true
+		}
+	}
+
+	out := make([]string, 0, len(threads))
+	for threadID := range threads {
+		out = append(out, threadID)
+		if threadID != rootThread {
+			delete(p.m, threadID)
+		}
+	}
+	return out
+}
+
 // SynapseBlackboardBus adapts a synapse.SynapseService to the BlackboardBus
 // contract. It also carries the auxiliary state that squads attach to the
 // blackboard at runtime (metrics registry and parent thread map).
@@ -179,6 +216,9 @@ func (b *SynapseBlackboardBus) SetMetrics(threadID string, metrics PipelineMetri
 }
 
 func (b *SynapseBlackboardBus) SendMessage(ctx context.Context, msg synapse.SynapseMessage) (*synapse.SynapseMessage, error) {
+	if msg.ParentThreadID == "" {
+		msg.ParentThreadID = b.parents.Get(msg.ThreadID)
+	}
 	return b.synapse.SendMessage(ctx, msg)
 }
 
@@ -193,12 +233,11 @@ func (b *SynapseBlackboardBus) ConsumeTask(ctx context.Context, threadID, squadI
 func (b *SynapseBlackboardBus) ParentThreads() *ParentThreadMap { return b.parents }
 
 func (b *SynapseBlackboardBus) Observability() *ObservabilityRuntime {
-	b.obs = b.obs.ensureDefaults()
 	return b.obs
 }
 
 // BoundedMap is a thread-safe map with a maximum size. When full, the oldest
-// key (by insertion order) is evicted. It mirrors the Python BoundedDict.
+// key (by insertion order) is evicted.
 type BoundedMap struct {
 	mu      sync.Mutex
 	m       map[string]any

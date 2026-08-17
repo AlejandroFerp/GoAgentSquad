@@ -1,3 +1,10 @@
 plan.md
 .serena
 MULTI_AGENT_RAG_PLAN.md
+.env
+local-tests/
+node_modules/
+test-results/
+playwright-report/
+blob-report/
+.playwright-mcp/

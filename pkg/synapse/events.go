@@ -3,8 +3,9 @@ package synapse
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"regexp"
-	"strings"
+	"runtime"
 	"sync"
 
 	"github.com/embention/agent-squad-go/pkg/observability"
@@ -28,18 +29,48 @@ type PreInsertCallback func(ctx context.Context, msg SynapseMessage) (*SynapseMe
 // PostInsertCallback is fired asynchronously after a message has been persisted.
 type PostInsertCallback func(ctx context.Context, msg SynapseMessage)
 
+// SubscriptionID uniquely identifies one EventBus listener registration.
+type SubscriptionID uint64
+
+// EventFilter selects messages using explicit fields. All configured criteria
+// must match; an empty filter matches nothing unless created with
+// MatchAllEventFilter.
+type EventFilter struct {
+	MessageClass MessageClass
+	ThreadID     *regexp.Regexp
+	SquadID      *regexp.Regexp
+	AgentID      *regexp.Regexp
+	matchAll     bool
+}
+
+// MatchAllEventFilter returns a filter that matches every message.
+func MatchAllEventFilter() EventFilter {
+	return EventFilter{matchAll: true}
+}
+
+// MessageClassEventFilter returns a filter that matches one message class.
+func MessageClassEventFilter(messageClass MessageClass) EventFilter {
+	return EventFilter{MessageClass: messageClass}
+}
+
+// ThreadEventFilter returns a filter that matches a thread ID using regex.
+func ThreadEventFilter(pattern string) EventFilter {
+	return EventFilter{ThreadID: regexp.MustCompile(pattern)}
+}
+
 type listener struct {
+	id         SubscriptionID
 	patternStr string
-	regex      *regexp.Regexp
+	filter     EventFilter
 	cb         any // PreInsertCallback or PostInsertCallback
 	eventType  EventType
 }
 
-// EventBus is a thread-safe pub/sub registry that matches messages against
-// regex patterns over thread_id, squad_id, agent_id, message_class, and content.
+// EventBus is a thread-safe pub/sub registry with explicit message filters.
 type EventBus struct {
 	mu        sync.RWMutex
 	listeners []listener
+	nextID    SubscriptionID
 }
 
 // NewEventBus returns an empty EventBus.
@@ -47,35 +78,51 @@ func NewEventBus() *EventBus {
 	return &EventBus{}
 }
 
-// Subscribe registers a callback for the given event type and pattern.
-// A pattern of "*" matches every message; otherwise the pattern is treated as
-// a regex matched against the message's identifying fields.
-func (b *EventBus) Subscribe(pattern string, cb any, eventType EventType) {
-	// A literal wildcard is normalized to a regex that matches every message.
-	regexSrc := ".*"
-	if pattern != "*" {
-		regexSrc = pattern
-	}
-	compiled := regexp.MustCompile(regexSrc)
+// SubscribePreInsert registers a callback that can mutate or block a message
+// before it is persisted. The pattern is matched against message fields.
+func (b *EventBus) SubscribePreInsert(pattern string, cb PreInsertCallback) SubscriptionID {
+	return b.subscribe(legacyEventFilter(pattern), pattern, cb, PreInsert)
+}
+
+// SubscribePostInsert registers a callback that runs asynchronously after a
+// matching message has been persisted. The pattern is matched against message fields.
+func (b *EventBus) SubscribePostInsert(pattern string, cb PostInsertCallback) SubscriptionID {
+	return b.subscribe(legacyEventFilter(pattern), pattern, cb, PostInsert)
+}
+
+// SubscribePreInsertFilter registers a typed pre-insert callback.
+func (b *EventBus) SubscribePreInsertFilter(filter EventFilter, cb PreInsertCallback) SubscriptionID {
+	return b.subscribe(filter, "typed filter", cb, PreInsert)
+}
+
+// SubscribePostInsertFilter registers a typed post-insert callback.
+func (b *EventBus) SubscribePostInsertFilter(filter EventFilter, cb PostInsertCallback) SubscriptionID {
+	return b.subscribe(filter, "typed filter", cb, PostInsert)
+}
+
+// subscribe registers a callback for the given event type and filter.
+func (b *EventBus) subscribe(filter EventFilter, pattern string, cb any, eventType EventType) SubscriptionID {
 	b.mu.Lock()
+	b.nextID++
+	id := b.nextID
 	b.listeners = append(b.listeners, listener{
+		id:         id,
 		patternStr: pattern,
-		regex:      compiled,
+		filter:     filter,
 		cb:         cb,
 		eventType:  eventType,
 	})
 	b.mu.Unlock()
+	return id
 }
 
-// Unsubscribe removes every registration that points to the given callback.
-// Comparison is done by pointer identity of the function value.
-func (b *EventBus) Unsubscribe(cb any) {
+// Unsubscribe removes exactly the listener registration identified by id.
+func (b *EventBus) Unsubscribe(id SubscriptionID) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := b.listeners[:0]
 	for _, l := range b.listeners {
-		// Compare underlying pointers for function values.
-		if !sameFunc(l.cb, cb) {
+		if l.id != id {
 			out = append(out, l)
 		}
 	}
@@ -98,7 +145,7 @@ func (b *EventBus) EmitPreInsert(ctx context.Context, msg SynapseMessage) (*Syna
 		}
 		cb, ok := l.cb.(PreInsertCallback)
 		if !ok {
-			continue
+			panic("Invariant violated: listener with eventType PreInsert has non-PreInsertCallback")
 		}
 		// Pre-insert hooks form a mutation chain: each hook sees the previous output.
 		next, err := cb(ctx, *current)
@@ -106,6 +153,10 @@ func (b *EventBus) EmitPreInsert(ctx context.Context, msg SynapseMessage) (*Syna
 			observability.LoggerFromContext(ctx).Error("synapse pre-insert callback blocked insertion",
 				"message_id", current.ID,
 				"thread_id", current.ThreadID,
+				"listener_pattern", l.patternStr,
+				"listener_event", l.eventType,
+				"listener_type", fmt.Sprintf("%T", l.cb),
+				"listener_name", functionName(l.cb),
 				"error", err,
 			)
 			return nil, err
@@ -134,7 +185,7 @@ func (b *EventBus) EmitPostInsert(ctx context.Context, msg SynapseMessage) {
 		}
 		cb, ok := l.cb.(PostInsertCallback)
 		if !ok {
-			continue
+			panic("Invariant violated: listener with eventType PostInsert has non-PostInsertCallback")
 		}
 		go func(cb PostInsertCallback, m SynapseMessage) {
 			defer func() {
@@ -142,6 +193,10 @@ func (b *EventBus) EmitPostInsert(ctx context.Context, msg SynapseMessage) {
 					observability.LoggerFromContext(ctx).Error("synapse post-insert callback panicked",
 						"message_id", m.ID,
 						"thread_id", m.ThreadID,
+						"listener_pattern", l.patternStr,
+						"listener_event", l.eventType,
+						"listener_type", fmt.Sprintf("%T", cb),
+						"listener_name", functionName(cb),
 						"panic", r,
 					)
 				}
@@ -151,40 +206,53 @@ func (b *EventBus) EmitPostInsert(ctx context.Context, msg SynapseMessage) {
 	}
 }
 
-// matches checks all message identity fields that observers commonly target.
+// legacyEventFilter preserves the old string API without content matching.
+// Wildcards match all messages, known classes match only that class, and any
+// other pattern is restricted to the thread ID for compatibility.
+func legacyEventFilter(pattern string) EventFilter {
+	if pattern == "*" {
+		return MatchAllEventFilter()
+	}
+	switch MessageClass(pattern) {
+	case ClassContextMessage, ClassTaskMessage, ClassCommandMessage:
+		return MessageClassEventFilter(MessageClass(pattern))
+	default:
+		return ThreadEventFilter(pattern)
+	}
+}
+
+// matches applies every configured filter criterion.
 func (l listener) matches(msg *SynapseMessage) bool {
-	if l.patternStr == "*" {
+	if l.filter.matchAll {
 		return true
 	}
-	if l.patternStr == string(msg.MessageClass) {
-		return true
+	if l.filter.MessageClass == "" && l.filter.ThreadID == nil && l.filter.SquadID == nil && l.filter.AgentID == nil {
+		return false
 	}
-	if l.regex.MatchString(msg.ThreadID) {
-		return true
+	if l.filter.MessageClass != "" && l.filter.MessageClass != msg.MessageClass {
+		return false
 	}
-	if msg.SquadID != "" && l.regex.MatchString(msg.SquadID) {
-		return true
+	if l.filter.ThreadID != nil && !l.filter.ThreadID.MatchString(msg.ThreadID) {
+		return false
 	}
-	if l.regex.MatchString(msg.AgentID) {
-		return true
+	if l.filter.SquadID != nil && !l.filter.SquadID.MatchString(msg.SquadID) {
+		return false
 	}
-	if l.regex.MatchString(string(msg.MessageClass)) {
-		return true
+	if l.filter.AgentID != nil && !l.filter.AgentID.MatchString(msg.AgentID) {
+		return false
 	}
-	if msg.MessageClass == ClassContextMessage {
-		if content := msg.Content(); content != "" && l.regex.MatchString(content) {
-			return true
-		}
-	}
-	return false
+	return true
 }
 
-// sameFunc reports whether two interface{} values wrapping a func are identical.
-func sameFunc(a, b any) bool {
-	return fmt.Sprintf("%p", a) == fmt.Sprintf("%p", b) && funcType(a) == funcType(b)
-}
+func functionName(value any) string {
+	reflected := reflect.ValueOf(value)
+	if !reflected.IsValid() || reflected.Kind() != reflect.Func || reflected.IsNil() {
+		return ""
+	}
 
-// funcType normalizes function type strings before sameFunc comparison.
-func funcType(v any) string {
-	return strings.Replace(fmt.Sprintf("%T", v), " ", "", -1)
+	function := runtime.FuncForPC(reflected.Pointer())
+	if function == nil {
+		return ""
+	}
+	return function.Name()
 }

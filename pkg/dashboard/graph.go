@@ -54,6 +54,19 @@ func BuildGraph(correlationID string, steps []observability.AgentStep) GraphMode
 			node.Status = "running"
 		}
 	}
+	setSquadStatus := func(node *GraphNode, step observability.AgentStep) {
+		if node == nil || node.Status == "error" {
+			return
+		}
+		switch {
+		case step.Kind == observability.StepError || step.Error != "":
+			node.Status = "error"
+		case step.Kind == observability.StepSynthesis && step.AgentID == step.SquadID+"-coordinator":
+			node.Status = "done"
+		case node.Status != "done":
+			node.Status = "running"
+		}
+	}
 
 	userNodeID := "user:" + correlationID
 	ensureNode(userNodeID, "User Query", "user")
@@ -64,15 +77,12 @@ func BuildGraph(correlationID string, steps []observability.AgentStep) GraphMode
 		var squadNodeID string
 		if step.SquadID != "" {
 			squadNodeID = "squad:" + step.SquadID
-			ensureNode(squadNodeID, step.SquadID, "squad")
+			setSquadStatus(ensureNode(squadNodeID, step.SquadID, "squad"), step)
 		}
 
 		var agentNodeID string
 		if step.AgentID != "" {
-			nodeType := "agent"
-			if strings.Contains(strings.ToLower(step.AgentType), "transversal") {
-				nodeType = "transversal"
-			}
+			nodeType := graphAgentNodeType(step)
 			agentNodeID = "agent:" + step.AgentID
 			agentNode := ensureNode(agentNodeID, step.AgentID, nodeType)
 			setStatus(agentNode, step)
@@ -111,7 +121,34 @@ func BuildGraph(correlationID string, steps []observability.AgentStep) GraphMode
 		}
 
 		if step.Kind == observability.StepResponded && agentNodeID != "" {
-			ensureEdge(agentNodeID, userNodeID, "reply", "response")
+			if squadNodeID != "" {
+				ensureEdge(agentNodeID, squadNodeID, "message", "result")
+			} else {
+				ensureEdge(agentNodeID, userNodeID, "reply", "response")
+			}
+		}
+
+		if step.Kind == observability.StepSynthesis && squadNodeID != "" && step.AgentID == step.SquadID+"-coordinator" {
+			if agentNodeID != "" {
+				ensureEdge(squadNodeID, agentNodeID, "coordination", "synthesize")
+				ensureEdge(agentNodeID, userNodeID, "summary", "summary")
+			} else {
+				ensureEdge(squadNodeID, userNodeID, "summary", "summary")
+			}
+		}
+	}
+	if terminal, ok := graphRootTerminalStep(correlationID, steps); ok {
+		userNode := ensureNode(userNodeID, "User Query", "user")
+		terminalStatus := graphTerminalStatus(terminal)
+		userNode.Status = terminalStatus
+		if terminalStatus == "done" {
+			// A root terminal event proves the pipeline quiesced. Single-agent
+			// squads can reach this state without a separate coordinator synthesis.
+			for _, node := range nodes {
+				if node.Type == "squad" && node.Status != "error" {
+					node.Status = "done"
+				}
+			}
 		}
 	}
 
@@ -128,6 +165,229 @@ func BuildGraph(correlationID string, steps []observability.AgentStep) GraphMode
 	sort.Slice(edgeList, func(i, j int) bool { return edgeList[i].ID < edgeList[j].ID })
 
 	return GraphModel{CorrelationID: correlationID, Nodes: nodeList, Edges: edgeList}
+}
+
+func graphRootTerminalStep(correlationID string, steps []observability.AgentStep) (observability.AgentStep, bool) {
+	if len(steps) == 0 {
+		return observability.AgentStep{}, false
+	}
+	last := steps[len(steps)-1]
+	if last.ThreadID != correlationID {
+		return observability.AgentStep{}, false
+	}
+	switch last.Kind {
+	case observability.StepResponded, observability.StepQuiesced, observability.StepError:
+		return last, true
+	default:
+		return observability.AgentStep{}, last.Error != ""
+	}
+}
+
+func graphTerminalStatus(step observability.AgentStep) string {
+	if step.Kind == observability.StepError || step.Error != "" {
+		return "error"
+	}
+	return "done"
+}
+
+func graphAgentNodeType(step observability.AgentStep) string {
+	if strings.EqualFold(step.AgentType, "COORDINATOR") || strings.HasSuffix(step.AgentID, "-coordinator") {
+		return "coordinator"
+	}
+	if strings.Contains(strings.ToLower(step.AgentType), "transversal") {
+		return "transversal"
+	}
+	return "agent"
+}
+
+// BuildWorkflowGraph combines query graphs into an aggregate execution view.
+func BuildWorkflowGraph(stages []WorkflowStage) GraphModel {
+	orderedStages := append([]WorkflowStage(nil), stages...)
+	sort.SliceStable(orderedStages, func(i, j int) bool {
+		if orderedStages[i].Summary.StartedAt.Equal(orderedStages[j].Summary.StartedAt) {
+			return orderedStages[i].Summary.CorrelationID < orderedStages[j].Summary.CorrelationID
+		}
+		return orderedStages[i].Summary.StartedAt.Before(orderedStages[j].Summary.StartedAt)
+	})
+	nodes := map[string]GraphNode{
+		"workflow:root": {
+			ID:     "workflow:root",
+			Label:  "Whole workflow",
+			Type:   "workflow",
+			Status: workflowStatus(orderedStages),
+		},
+	}
+	edges := map[string]GraphEdge{}
+	for index, stage := range orderedStages {
+		phaseID := "phase:" + stage.Summary.CorrelationID
+		nodes[phaseID] = GraphNode{
+			ID:     phaseID,
+			Label:  workflowStageLabel(stage.Summary.Summary, index+1),
+			Type:   "phase",
+			Status: queryStatus(stage.Summary.Status),
+		}
+		mergeGraphEdge(edges, GraphEdge{
+			Source: "workflow:root",
+			Target: phaseID,
+			Kind:   "workflow",
+			Label:  "phase",
+			Count:  1,
+		})
+
+		queryGraph := BuildGraph(stage.Summary.CorrelationID, stage.Timeline)
+		queryUserID := "user:" + stage.Summary.CorrelationID
+		for _, node := range queryGraph.Nodes {
+			if node.ID == queryUserID {
+				continue
+			}
+			mergeGraphNode(nodes, node)
+		}
+		for _, edge := range queryGraph.Edges {
+			if edge.Source == queryUserID {
+				edge.Source = phaseID
+			}
+			if edge.Target == queryUserID {
+				edge.Target = phaseID
+			}
+			mergeGraphEdge(edges, edge)
+		}
+	}
+	if terminalStatus, terminal := workflowTerminalState(orderedStages); terminal {
+		lastStage := orderedStages[len(orderedStages)-1]
+		terminalID := "terminal:workflow"
+		terminalLabel := "Workflow complete"
+		if terminalStatus == "error" {
+			terminalLabel = "Workflow stopped"
+		}
+		nodes[terminalID] = GraphNode{
+			ID:     terminalID,
+			Label:  terminalLabel,
+			Type:   "terminal",
+			Status: terminalStatus,
+		}
+		mergeGraphEdge(edges, GraphEdge{
+			Source: "phase:" + lastStage.Summary.CorrelationID,
+			Target: terminalID,
+			Kind:   "completion",
+			Label:  "complete",
+			Count:  1,
+		})
+	}
+
+	nodeList := make([]GraphNode, 0, len(nodes))
+	for _, node := range nodes {
+		nodeList = append(nodeList, node)
+	}
+	sort.Slice(nodeList, func(i, j int) bool { return nodeList[i].ID < nodeList[j].ID })
+	edgeList := make([]GraphEdge, 0, len(edges))
+	for _, edge := range edges {
+		edgeList = append(edgeList, edge)
+	}
+	sort.Slice(edgeList, func(i, j int) bool { return edgeList[i].ID < edgeList[j].ID })
+	return GraphModel{CorrelationID: WorkflowCorrelationID, Nodes: nodeList, Edges: edgeList}
+}
+
+func mergeGraphNode(nodes map[string]GraphNode, node GraphNode) {
+	existing, found := nodes[node.ID]
+	if !found {
+		nodes[node.ID] = node
+		return
+	}
+	existing.Calls += node.Calls
+	existing.TokensIn += node.TokensIn
+	existing.TokensOut += node.TokensOut
+	if graphStatusRank(node.Status) > graphStatusRank(existing.Status) {
+		existing.Status = node.Status
+	}
+	nodes[node.ID] = existing
+}
+
+func mergeGraphEdge(edges map[string]GraphEdge, edge GraphEdge) {
+	edge.ID = fmt.Sprintf("%s|%s|%s|%s", edge.Source, edge.Target, edge.Kind, edge.Label)
+	existing, found := edges[edge.ID]
+	if found {
+		existing.Count += edge.Count
+		edges[edge.ID] = existing
+		return
+	}
+	edges[edge.ID] = edge
+}
+
+func workflowStatus(stages []WorkflowStage) string {
+	if status, terminal := workflowTerminalState(stages); terminal {
+		return status
+	}
+	for _, stage := range stages {
+		if queryStatus(stage.Summary.Status) == "running" {
+			return "running"
+		}
+	}
+	return "idle"
+}
+
+func workflowTerminalState(stages []WorkflowStage) (string, bool) {
+	if len(stages) == 0 {
+		return "idle", false
+	}
+	hasRunning := false
+	hasIdle := false
+	hasError := false
+	for _, stage := range stages {
+		switch queryStatus(stage.Summary.Status) {
+		case "error":
+			hasError = true
+		case "running":
+			hasRunning = true
+		case "idle":
+			hasIdle = true
+		}
+	}
+	if hasError {
+		return "error", !hasRunning && !hasIdle
+	}
+	if hasRunning || hasIdle {
+		return "running", false
+	}
+	return "done", true
+}
+
+func queryStatus(status string) string {
+	switch status {
+	case "error":
+		return "error"
+	case "running":
+		return "running"
+	case "done":
+		return "done"
+	default:
+		return "idle"
+	}
+}
+
+func graphStatusRank(status string) int {
+	switch status {
+	case "error":
+		return 3
+	case "running":
+		return 2
+	case "done":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func workflowStageLabel(summary string, phaseNumber int) string {
+	const maxRunes = 32
+	label := fmt.Sprintf("Phase %d", phaseNumber)
+	if summary == "" {
+		return label
+	}
+	runes := []rune(summary)
+	if len(runes) > maxRunes {
+		summary = string(runes[:maxRunes]) + "..."
+	}
+	return label + ": " + summary
 }
 
 // BuildMetricsSummary derives dashboard summary cards from a query timeline.
@@ -166,5 +426,16 @@ func BuildMetricsSummary(correlationID string, steps []observability.AgentStep) 
 	if !earliest.IsZero() && !latest.IsZero() && latest.After(earliest) {
 		summary.DurationMS = latest.Sub(earliest).Milliseconds()
 	}
+	return summary
+}
+
+func addHubMetrics(summary MetricsSummary, hub *observability.Hub) MetricsSummary {
+	if hub == nil {
+		return summary
+	}
+	stats := hub.Stats()
+	summary.SSEDropped = stats.DroppedEvents
+	summary.SSESubscribers = stats.Subscribers
+	summary.SSEMaxClients = stats.MaxSubscribers
 	return summary
 }

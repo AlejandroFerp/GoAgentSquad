@@ -20,18 +20,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
 
 	if s.obs == nil || s.obs.Hub == nil {
 		// SSE comment frame used as a diagnostic marker for clients.
+		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, ": no hub configured\n\n")
 		flusher.Flush()
 		return
 	}
 
 	// Subscribe this HTTP connection to the in-memory event hub.
-	id, ch := s.obs.Hub.Subscribe()
+	id, ch, ok := s.obs.Hub.TrySubscribe()
+	if !ok {
+		http.Error(w, "too many live stream subscribers", http.StatusServiceUnavailable)
+		return
+	}
 	defer s.obs.Hub.Unsubscribe(id)
+	w.WriteHeader(http.StatusOK)
 
 	// Initial comment frame confirms the stream is ready.
 	fmt.Fprint(w, ": connected\n\n")

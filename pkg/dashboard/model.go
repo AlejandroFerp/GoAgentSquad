@@ -2,6 +2,8 @@ package dashboard
 
 import "github.com/embention/agent-squad-go/pkg/observability"
 
+const WorkflowCorrelationID = "workflow"
+
 // GraphModel is the graph projection of a query timeline consumed by the web UI.
 type GraphModel struct {
 	CorrelationID string      `json:"correlation_id"`
@@ -38,9 +40,18 @@ type MetricsSummary struct {
 	ToolCalls      int    `json:"tool_calls"`
 	UniqueAgents   int    `json:"unique_agents"`
 	Errors         int    `json:"errors"`
+	SSEDropped     int    `json:"sse_dropped_events"`
+	SSESubscribers int    `json:"sse_subscribers"`
+	SSEMaxClients  int    `json:"sse_max_clients"`
 }
 
 type QuerySnapshot struct {
 	Summary observability.QuerySummary `json:"summary"`
 	Metrics MetricsSummary             `json:"metrics"`
+}
+
+// WorkflowStage is one query execution included in the aggregate dashboard view.
+type WorkflowStage struct {
+	Summary  observability.QuerySummary
+	Timeline []observability.AgentStep
 }

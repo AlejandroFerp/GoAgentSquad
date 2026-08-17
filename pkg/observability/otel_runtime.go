@@ -3,7 +3,6 @@ package observability
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -11,17 +10,6 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-)
-
-const (
-	envSquadOTelEnabled        = "SQUAD_OTEL_ENABLED"
-	envSquadOTelServiceName    = "SQUAD_OTEL_SERVICE_NAME"
-	envSquadOTelServiceVersion = "SQUAD_OTEL_SERVICE_VERSION"
-	envSquadOTelTracerName     = "SQUAD_OTEL_TRACER_NAME"
-	envSquadOTelEndpoint       = "SQUAD_OTEL_ENDPOINT"
-	envSquadOTelInsecure       = "SQUAD_OTEL_INSECURE"
-	envSquadOTelHeaders        = "SQUAD_OTEL_HEADERS"
-	envSquadOTelBatchTimeout   = "SQUAD_OTEL_BATCH_TIMEOUT"
 )
 
 // OTelRuntimeConfig describes how to build a real OpenTelemetry-backed tracer.
@@ -41,8 +29,6 @@ type OTelRuntime struct {
 	Provider *sdktrace.TracerProvider
 	Tracer   Tracer
 }
-
-type envLookup func(string) (string, bool)
 
 // NewOTelRuntime builds a tracer provider and adapts it to the local tracer contract.
 func NewOTelRuntime(ctx context.Context, cfg OTelRuntimeConfig) (*OTelRuntime, error) {
@@ -81,71 +67,6 @@ func (r *OTelRuntime) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	return r.Provider.Shutdown(ctx)
-}
-
-// OTelRuntimeConfigFromEnv loads the demo/runtime OpenTelemetry settings from environment variables.
-// It returns enabled=false when no OTel-specific environment variable is present or when SQUAD_OTEL_ENABLED=false.
-func OTelRuntimeConfigFromEnv(lookup func(string) (string, bool), defaults OTelRuntimeConfig) (OTelRuntimeConfig, bool, error) {
-	if lookup == nil {
-		lookup = func(string) (string, bool) { return "", false }
-	}
-
-	cfg := defaults
-	enabled := false
-
-	if raw, ok := lookup(envSquadOTelEnabled); ok {
-		parsed, err := strconv.ParseBool(strings.TrimSpace(raw))
-		if err != nil {
-			return cfg, false, fmt.Errorf("parse %s: %w", envSquadOTelEnabled, err)
-		}
-		if !parsed {
-			return cfg, false, nil
-		}
-		enabled = true
-	}
-
-	if raw, ok := lookup(envSquadOTelServiceName); ok {
-		cfg.ServiceName = strings.TrimSpace(raw)
-		enabled = true
-	}
-	if raw, ok := lookup(envSquadOTelServiceVersion); ok {
-		cfg.ServiceVersion = strings.TrimSpace(raw)
-		enabled = true
-	}
-	if raw, ok := lookup(envSquadOTelTracerName); ok {
-		cfg.TracerName = strings.TrimSpace(raw)
-		enabled = true
-	}
-	if raw, ok := lookup(envSquadOTelEndpoint); ok {
-		cfg.Endpoint = strings.TrimSpace(raw)
-		enabled = true
-	}
-	if raw, ok := lookup(envSquadOTelInsecure); ok {
-		parsed, err := strconv.ParseBool(strings.TrimSpace(raw))
-		if err != nil {
-			return cfg, false, fmt.Errorf("parse %s: %w", envSquadOTelInsecure, err)
-		}
-		cfg.Insecure = parsed
-		enabled = true
-	}
-	if raw, ok := lookup(envSquadOTelHeaders); ok {
-		headers, err := ParseOTLPHeaders(raw)
-		if err != nil {
-			return cfg, false, fmt.Errorf("parse %s: %w", envSquadOTelHeaders, err)
-		}
-		cfg.Headers = headers
-		enabled = true
-	}
-	if raw, ok := lookup(envSquadOTelBatchTimeout); ok {
-		parsed, err := time.ParseDuration(strings.TrimSpace(raw))
-		if err != nil {
-			return cfg, false, fmt.Errorf("parse %s: %w", envSquadOTelBatchTimeout, err)
-		}
-		cfg.BatchTimeout = parsed
-		enabled = true
-	}
-
-	return cfg, enabled, nil
 }
 
 // ParseOTLPHeaders parses a comma-separated key=value list into OTLP headers.

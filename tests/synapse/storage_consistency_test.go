@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
@@ -75,7 +76,7 @@ func TestSendMessageStorageFailureDoesNotExposeMessage(t *testing.T) {
 	defer svc.Close()
 
 	storage.setFailSave(true)
-	msg := synapse.NewContextMessage("thread-storage-save", "agent-1", synapse.RoleUser, "not durable", "", nil, 3600)
+	msg := synapse.NewContextMessage("thread-storage-save", "agent-1", synapse.RoleUser, "not durable", "", nil, time.Hour)
 	sent, err := svc.SendMessage(ctx, msg)
 	if err == nil {
 		t.Fatal("expected SendMessage to return storage error")
@@ -102,7 +103,7 @@ func TestConsumeTaskStorageFailureDoesNotCommitConsumption(t *testing.T) {
 	}
 	defer svc.Close()
 
-	msg := synapse.NewTaskMessage("thread-storage-consume", "agent-1", "work", "reply-thread", nil, "squad-1", 3600, 2)
+	msg := synapse.NewTaskMessage("thread-storage-consume", "agent-1", "work", "reply-thread", nil, "squad-1", time.Hour, 2)
 	if _, err := svc.SendMessage(ctx, msg); err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
@@ -138,7 +139,7 @@ func TestDeleteMessageStorageFailureKeepsMessageVisible(t *testing.T) {
 	}
 	defer svc.Close()
 
-	msg := synapse.NewContextMessage("thread-storage-delete", "agent-1", synapse.RoleUser, "still visible", "", nil, 3600)
+	msg := synapse.NewContextMessage("thread-storage-delete", "agent-1", synapse.RoleUser, "still visible", "", nil, time.Hour)
 	if _, err := svc.SendMessage(ctx, msg); err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}

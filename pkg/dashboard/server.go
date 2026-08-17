@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"embed"
+	"fmt"
 	"io/fs"
 	"net/http"
 
@@ -45,7 +46,10 @@ func NewServer(obs *squads.ObservabilityRuntime, options ...Option) *Server {
 		// Keep constructor safe for callers that only need a standalone dashboard.
 		obs = squads.NewObservabilityRuntime()
 	}
-	webFS, _ := fs.Sub(embeddedWeb, "web")
+	webFS, err := fs.Sub(embeddedWeb, "web")
+	if err != nil {
+		panic(fmt.Sprintf("dashboard embedded assets: %v", err))
+	}
 	server := &Server{
 		obs:    obs,
 		mux:    http.NewServeMux(),
@@ -67,6 +71,7 @@ func (s *Server) routes() {
 	// REST endpoints consumed by the dashboard web app.
 	s.mux.HandleFunc("/api/queries", s.handleQueries)
 	s.mux.HandleFunc("/api/queries/", s.handleQueryResource)
+	s.mux.HandleFunc("/api/workflow/", s.handleWorkflowResource)
 	s.mux.HandleFunc("/api/metrics/summary", s.handleMetricsSummary)
 	// SSE stream for live step updates.
 	s.mux.HandleFunc("/api/stream", s.handleStream)

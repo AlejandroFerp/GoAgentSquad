@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/embention/agent-squad-go/pkg/config"
 	"github.com/embention/agent-squad-go/pkg/dashboard"
 	"github.com/embention/agent-squad-go/pkg/observability"
 	"github.com/embention/agent-squad-go/pkg/squads"
@@ -51,7 +52,7 @@ func (f *FinalSynthesizerImpl) Synthesize(ctx context.Context, threadID, squadID
 		}
 	}
 	f.LastContent = fmt.Sprintf("### [Final Response Synthesis for Squad: %s]\n%s", squadID, strings.Join(insights, "\n"))
-	finalMsg := synapse.NewContextMessage(threadID, "squad-leader-synthesizer", synapse.RoleAssistant, f.LastContent, "", nil, 3600)
+	finalMsg := synapse.NewContextMessage(threadID, "squad-leader-synthesizer", synapse.RoleAssistant, f.LastContent, "", nil, time.Hour)
 	_, err = f.Blackboard.SendMessage(ctx, finalMsg)
 	return err
 }
@@ -62,36 +63,41 @@ func (f *FinalSynthesizerImpl) LastSynthesizedContent() string {
 }
 
 // mockLLMCall is a deterministic LLM stub that returns canned responses.
-func mockLLMCall(ctx context.Context, model, systemPrompt string, messages []map[string]any) (map[string]any, error) {
+func mockLLMCall(ctx context.Context, model, systemPrompt string, messages []map[string]any) (squads.LLMResponse, error) {
 	// If the system prompt mentions "correction helper", return a healed argument.
 	if strings.Contains(systemPrompt, "correction helper") {
-		return map[string]any{
-			"content":           `{"query": "healed"}`,
-			"prompt_tokens":     10,
-			"completion_tokens": 5,
-			"total_tokens":      15,
+		return squads.LLMResponse{
+			Content:          `{"query": "healed"}`,
+			PromptTokens:     10,
+			CompletionTokens: 5,
+			TotalTokens:      15,
 		}, nil
 	}
 	// If the system prompt mentions "Integrate the tool result", produce a final answer.
 	if strings.Contains(systemPrompt, "Integrate the tool result") {
-		return map[string]any{
-			"content":           "Based on the scripture analysis, the passage speaks of God's love.",
-			"prompt_tokens":     20,
-			"completion_tokens": 15,
-			"total_tokens":      35,
+		return squads.LLMResponse{
+			Content:          "Based on the scripture analysis, the passage speaks of God's love.",
+			PromptTokens:     20,
+			CompletionTokens: 15,
+			TotalTokens:      35,
 		}, nil
 	}
 	// Default: respond with a plain answer.
-	return map[string]any{
-		"content":           "Theological analysis complete: the passage reveals divine love and grace.",
-		"prompt_tokens":     30,
-		"completion_tokens": 20,
-		"total_tokens":      50,
+	return squads.LLMResponse{
+		Content:          "Theological analysis complete: the passage reveals divine love and grace.",
+		PromptTokens:     30,
+		CompletionTokens: 20,
+		TotalTokens:      50,
 	}, nil
 }
 
 func main() {
 	ctx := context.Background()
+
+	settings, err := config.LoadDemo(os.Args[1:])
+	if err != nil {
+		log.Fatalf("demo config: %v", err)
+	}
 
 	// 1. Initialize Synapse engine and blackboard.
 	svc := synapse.NewSynapseService(50, nil)
@@ -101,16 +107,8 @@ func main() {
 	defer svc.Close()
 
 	blackboard := squads.NewSynapseBlackboardBus(svc)
-	otelConfig, otelEnabled, err := observability.OTelRuntimeConfigFromEnv(os.LookupEnv, observability.OTelRuntimeConfig{
-		ServiceName:    "agent-squad-demo",
-		ServiceVersion: "dev",
-		TracerName:     "agent-squad-demo",
-	})
-	if err != nil {
-		log.Fatalf("opentelemetry config: %v", err)
-	}
-	if otelEnabled {
-		otelRuntime, err := observability.NewOTelRuntime(ctx, otelConfig)
+	if settings.OTel.Enabled {
+		otelRuntime, err := observability.NewOTelRuntime(ctx, settings.OTel.Runtime)
 		if err != nil {
 			log.Fatalf("opentelemetry init: %v", err)
 		}
@@ -122,20 +120,20 @@ func main() {
 				log.Printf("opentelemetry shutdown error: %v", shutdownErr)
 			}
 		}()
-		fmt.Printf("OpenTelemetry tracing enabled for service %s\n", otelConfig.ServiceName)
+		fmt.Printf("OpenTelemetry tracing enabled for service %s\n", settings.OTel.Runtime.ServiceName)
 	}
-	if traceFile := os.Getenv("SQUAD_TRACE_JSONL"); traceFile != "" {
-		blackboard.Observability().Exporter = &observability.JSONFileExporter{Path: traceFile}
-		fmt.Printf("Trace export enabled at %s\n", traceFile)
+	if settings.TraceJSONL != "" {
+		blackboard.Observability().Exporter = &observability.JSONFileExporter{Path: settings.TraceJSONL}
+		fmt.Printf("Trace export enabled at %s\n", settings.TraceJSONL)
 	}
-	if addr := os.Getenv("SQUAD_DASHBOARD_ADDR"); addr != "" {
+	if settings.DashboardAddress != "" {
 		server := dashboard.NewServer(blackboard.Observability())
 		go func() {
-			if err := http.ListenAndServe(addr, server); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := http.ListenAndServe(settings.DashboardAddress, server); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("dashboard server error: %v", err)
 			}
 		}()
-		fmt.Printf("Dashboard available at http://%s\n", addr)
+		fmt.Printf("Dashboard available at http://%s\n", settings.DashboardAddress)
 	}
 
 	// 2. Create the final synthesizer.
@@ -187,12 +185,12 @@ func main() {
 	pipeline.RegisterObserver(observer)
 
 	// 7. Set a simple route query function.
-	pipeline.RouteQueryFn = func(ctx context.Context, content string) (any, error) {
-		return "squad-pastoral", nil
+	pipeline.RouteQueryFn = func(ctx context.Context, content string) ([]string, error) {
+		return []string{"squad-pastoral"}, nil
 	}
 
 	// 8. Run a query.
-	res, err := pipeline.Query(ctx, "session-thread-01", nil, "I need counseling and theology info about [Juan 3:16].", 10.0)
+	res, err := pipeline.Query(ctx, "session-thread-01", nil, "I need counseling and theology info about [Juan 3:16].", 10*time.Second)
 	if err != nil {
 		log.Fatalf("pipeline query: %v", err)
 	}
@@ -202,7 +200,7 @@ func main() {
 	fmt.Println()
 	fmt.Println("=== Metrics ===")
 	fmt.Printf("Status: %v\n", res.Metrics["status"])
-	fmt.Printf("Elapsed: %.4fs\n", res.Metrics["elapsed_time"])
+	fmt.Printf("Elapsed: %s\n", res.Metrics["elapsed_time"])
 	if squadsMap, ok := res.Metrics["squads"].(map[string]any); ok {
 		fmt.Println("Squads Run:", keys(squadsMap))
 	}

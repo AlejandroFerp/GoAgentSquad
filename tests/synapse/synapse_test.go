@@ -2,6 +2,9 @@ package synapse_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,6 +12,14 @@ import (
 
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
+
+type postInsertListener struct {
+	calls atomic.Int32
+}
+
+func (l *postInsertListener) handle(context.Context, synapse.SynapseMessage) {
+	l.calls.Add(1)
+}
 
 func TestNewSynapseService(t *testing.T) {
 	svc := synapse.NewSynapseService(10, nil)
@@ -18,7 +29,7 @@ func TestNewSynapseService(t *testing.T) {
 	}
 	defer svc.Close()
 
-	msg := synapse.NewContextMessage("thread-1", "agent-1", synapse.RoleUser, "hello", "", nil, 3600)
+	msg := synapse.NewContextMessage("thread-1", "agent-1", synapse.RoleUser, "hello", "", nil, time.Hour)
 	sent, err := svc.SendMessage(ctx, msg)
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
@@ -29,6 +40,7 @@ func TestNewSynapseService(t *testing.T) {
 	if sent.ID != msg.ID {
 		t.Errorf("expected same ID, got %s", sent.ID)
 	}
+	sent.SetPayloadValue("content", "mutated outside blackboard")
 
 	got, err := svc.FetchContext(ctx, "thread-1", 10)
 	if err != nil {
@@ -42,6 +54,22 @@ func TestNewSynapseService(t *testing.T) {
 	}
 }
 
+func TestSynapseMessageUsesStandardTimeTypes(t *testing.T) {
+	msg := synapse.NewContextMessage("thread-time", "agent-time", synapse.RoleUser, "hello", "", nil, time.Minute)
+	if msg.Timestamp.IsZero() {
+		t.Fatal("Timestamp must be initialized")
+	}
+	if msg.TTL != time.Minute {
+		t.Fatalf("TTL = %s, want %s", msg.TTL, time.Minute)
+	}
+	if msg.IsExpired(msg.Timestamp.Add(time.Minute - time.Nanosecond)) {
+		t.Fatal("message expired before its TTL elapsed")
+	}
+	if !msg.IsExpired(msg.Timestamp.Add(time.Minute)) {
+		t.Fatal("message did not expire at its TTL")
+	}
+}
+
 func TestEventBusPreInsertMutation(t *testing.T) {
 	svc := synapse.NewSynapseService(10, nil)
 	ctx := context.Background()
@@ -49,13 +77,13 @@ func TestEventBusPreInsertMutation(t *testing.T) {
 	defer svc.Close()
 
 	called := atomic.Int32{}
-	svc.Events.Subscribe("*", synapse.PreInsertCallback(func(ctx context.Context, msg synapse.SynapseMessage) (*synapse.SynapseMessage, error) {
+	svc.Events.SubscribePreInsert("*", synapse.PreInsertCallback(func(ctx context.Context, msg synapse.SynapseMessage) (*synapse.SynapseMessage, error) {
 		called.Add(1)
-		msg.Payload["content"] = "mutated"
+		msg.SetPayloadValue("content", "mutated")
 		return &msg, nil
-	}), "pre_insert")
+	}))
 
-	msg := synapse.NewContextMessage("thread-2", "agent-1", synapse.RoleUser, "original", "", nil, 3600)
+	msg := synapse.NewContextMessage("thread-2", "agent-1", synapse.RoleUser, "original", "", nil, time.Hour)
 	sent, err := svc.SendMessage(ctx, msg)
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
@@ -74,11 +102,11 @@ func TestEventBusPreInsertBlock(t *testing.T) {
 	_ = svc.Connect(ctx)
 	defer svc.Close()
 
-	svc.Events.Subscribe("*", synapse.PreInsertCallback(func(ctx context.Context, msg synapse.SynapseMessage) (*synapse.SynapseMessage, error) {
+	svc.Events.SubscribePreInsert("*", synapse.PreInsertCallback(func(ctx context.Context, msg synapse.SynapseMessage) (*synapse.SynapseMessage, error) {
 		return nil, nil
-	}), "pre_insert")
+	}))
 
-	msg := synapse.NewContextMessage("thread-3", "agent-1", synapse.RoleUser, "blocked", "", nil, 3600)
+	msg := synapse.NewContextMessage("thread-3", "agent-1", synapse.RoleUser, "blocked", "", nil, time.Hour)
 	sent, err := svc.SendMessage(ctx, msg)
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
@@ -96,13 +124,13 @@ func TestEventBusPostInsertConcurrent(t *testing.T) {
 
 	var wg sync.WaitGroup
 	counter := atomic.Int32{}
-	svc.Events.Subscribe("*", synapse.PostInsertCallback(func(ctx context.Context, msg synapse.SynapseMessage) {
+	svc.Events.SubscribePostInsert("*", synapse.PostInsertCallback(func(ctx context.Context, msg synapse.SynapseMessage) {
 		defer wg.Done()
 		counter.Add(1)
-	}), "post_insert")
+	}))
 
 	wg.Add(1)
-	msg := synapse.NewContextMessage("thread-4", "agent-1", synapse.RoleUser, "post", "", nil, 3600)
+	msg := synapse.NewContextMessage("thread-4", "agent-1", synapse.RoleUser, "post", "", nil, time.Hour)
 	_, _ = svc.SendMessage(ctx, msg)
 
 	done := make(chan struct{})
@@ -120,13 +148,177 @@ func TestEventBusPostInsertConcurrent(t *testing.T) {
 	}
 }
 
+func TestEventBusUnsubscribePreservesOtherMethodListener(t *testing.T) {
+	events := synapse.NewEventBus()
+	first := &postInsertListener{}
+	second := &postInsertListener{}
+
+	firstSubscription := events.SubscribePostInsert("*", first.handle)
+	events.SubscribePostInsert("*", second.handle)
+	events.Unsubscribe(firstSubscription)
+
+	events.EmitPostInsert(context.Background(), synapse.NewContextMessage(
+		"thread-listener", "agent", synapse.RoleUser, "message", "", nil, time.Minute,
+	))
+
+	deadline := time.After(time.Second)
+	for second.calls.Load() != 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("second listener was removed with the first; calls=%d", second.calls.Load())
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if first.calls.Load() != 0 {
+		t.Errorf("first listener received %d calls after unsubscribe", first.calls.Load())
+	}
+}
+
+func TestEventFilterDoesNotMatchMessageContent(t *testing.T) {
+	events := synapse.NewEventBus()
+	called := make(chan struct{}, 1)
+	events.SubscribePostInsertFilter(
+		synapse.MessageClassEventFilter(synapse.ClassTaskMessage),
+		func(context.Context, synapse.SynapseMessage) { called <- struct{}{} },
+	)
+	events.EmitPostInsert(context.Background(), synapse.NewContextMessage(
+		"thread-filter", "agent", synapse.RoleUser, "TaskMessage", "", nil, time.Minute,
+	))
+	select {
+	case <-called:
+		t.Fatal("task listener matched a context message based on content")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestEventFilterMatchesAllConfiguredFields(t *testing.T) {
+	events := synapse.NewEventBus()
+	called := make(chan struct{}, 1)
+	filter := synapse.EventFilter{
+		MessageClass: synapse.ClassTaskMessage,
+		ThreadID:     regexp.MustCompile(`^thread-filter$`),
+	}
+	events.SubscribePostInsertFilter(filter, func(context.Context, synapse.SynapseMessage) { called <- struct{}{} })
+	events.EmitPostInsert(context.Background(), synapse.NewTaskMessage(
+		"other-thread", "agent", "work", "reply", nil, "squad", time.Minute, 1,
+	))
+	select {
+	case <-called:
+		t.Fatal("filter matched a message with the wrong thread")
+	case <-time.After(50 * time.Millisecond):
+	}
+	events.EmitPostInsert(context.Background(), synapse.NewTaskMessage(
+		"thread-filter", "agent", "work", "reply", nil, "squad", time.Minute, 1,
+	))
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("filter did not match all configured fields")
+	}
+}
+
+func TestMemoryStorageReloadsMessagesWithoutSharingPayload(t *testing.T) {
+	ctx := context.Background()
+	storage := synapse.NewMemoryStorage()
+	first := synapse.NewSynapseService(10, storage)
+	if err := first.Connect(ctx); err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	msg := synapse.NewTaskMessage("thread-memory", "agent", "work", "reply", map[string]any{
+		"nested": map[string]any{"value": "original"},
+	}, "squad", time.Hour, 1)
+	if _, err := first.SendMessage(ctx, msg); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	stored, err := storage.LoadAllActiveMessages(ctx)
+	if err != nil {
+		t.Fatalf("LoadAllActiveMessages: %v", err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("stored message count = %d, want 1", len(stored))
+	}
+	stored[0].SetPayloadValue("parameters", map[string]any{
+		"nested": map[string]any{"value": "mutated outside storage"},
+	})
+	storedAgain, err := storage.LoadAllActiveMessages(ctx)
+	if err != nil {
+		t.Fatalf("LoadAllActiveMessages after mutation: %v", err)
+	}
+	if got := storedAgain[0].Parameters()["nested"].(map[string]any)["value"]; got != "original" {
+		t.Fatalf("storage payload was externally mutated, got %v", got)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	second := synapse.NewSynapseService(10, storage)
+	if err := second.Connect(ctx); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+	defer second.Close()
+	loaded, err := second.FetchContext(ctx, "thread-memory", 10)
+	if err != nil {
+		t.Fatalf("FetchContext: %v", err)
+	}
+	if len(loaded) != 0 {
+		t.Fatalf("expected no context messages for task thread, got %d", len(loaded))
+	}
+	consumed, err := second.ConsumeTask(ctx, "thread-memory", "squad", "work", "", 1)
+	if err != nil {
+		t.Fatalf("ConsumeTask: %v", err)
+	}
+	if len(consumed) != 1 {
+		t.Fatalf("expected one reloaded task, got %d", len(consumed))
+	}
+	params := consumed[0].Parameters()
+	params["nested"].(map[string]any)["value"] = "mutated"
+	consumedAgain, err := second.ConsumeTask(ctx, "thread-memory", "squad", "work", "", 1)
+	if err != nil {
+		t.Fatalf("second ConsumeTask: %v", err)
+	}
+	if len(consumedAgain) != 0 {
+		t.Fatal("task with max consumers=1 was not removed")
+	}
+}
+
+func TestConnectInvalidPersistedMessageDoesNotRetainMutex(t *testing.T) {
+	storage := &invalidMessageStorage{}
+	svc := synapse.NewSynapseService(10, storage)
+	if err := svc.Connect(context.Background()); err == nil {
+		t.Fatal("expected invalid persisted message error")
+	}
+	done := make(chan struct{})
+	go func() {
+		_, _ = svc.FetchContext(context.Background(), "thread", 1)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("service mutex remained locked after Connect failure")
+	}
+}
+
+type invalidMessageStorage struct{}
+
+func (*invalidMessageStorage) Connect(context.Context) error { return nil }
+func (*invalidMessageStorage) Close() error                  { return nil }
+func (*invalidMessageStorage) SaveMessage(context.Context, synapse.SynapseMessage) error {
+	return errors.New("not implemented")
+}
+func (*invalidMessageStorage) DeleteMessage(context.Context, string) error { return nil }
+func (*invalidMessageStorage) LoadAllActiveMessages(context.Context) ([]synapse.SynapseMessage, error) {
+	return []synapse.SynapseMessage{{ID: "invalid"}}, nil
+}
+
 func TestConsumeTaskAtomic(t *testing.T) {
 	svc := synapse.NewSynapseService(10, nil)
 	ctx := context.Background()
 	_ = svc.Connect(ctx)
 	defer svc.Close()
 
-	msg := synapse.NewTaskMessage("thread-5", "agent-1", "bible_study", "reply-thread-5", map[string]any{"passage": "Juan 3:16"}, "squad-1", 3600, 1)
+	msg := synapse.NewTaskMessage("thread-5", "agent-1", "bible_study", "reply-thread-5", map[string]any{"passage": "Juan 3:16"}, "squad-1", time.Hour, 1)
 	_, err := svc.SendMessage(ctx, msg)
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
@@ -157,12 +349,10 @@ func TestGarbageCollector(t *testing.T) {
 	_ = svc.Connect(ctx)
 	defer svc.Close()
 
-	// Create a message with a very short TTL and wait for it to expire.
-	msg := synapse.NewContextMessage("thread-6", "agent-1", synapse.RoleUser, "expires", "", nil, 1)
+	msg := synapse.NewContextMessage("thread-6", "agent-1", synapse.RoleUser, "expires", "", nil, time.Second)
+	msg.Timestamp = time.Now().Add(-2 * time.Second)
 	_, _ = svc.SendMessage(ctx, msg)
 
-	// Wait for the message to expire.
-	time.Sleep(1100 * time.Millisecond)
 	svc.CollectExpired(ctx)
 
 	// The message should be gone.
@@ -184,7 +374,7 @@ func TestFetchContextCacheReturnsClonedMessages(t *testing.T) {
 	defer svc.Close()
 
 	for _, content := range []string{"first", "second"} {
-		msg := synapse.NewContextMessage("thread-cache-clone", "agent-1", synapse.RoleUser, content, "", nil, 3600)
+		msg := synapse.NewContextMessage("thread-cache-clone", "agent-1", synapse.RoleUser, content, "", nil, time.Hour)
 		if _, err := svc.SendMessage(ctx, msg); err != nil {
 			t.Fatalf("SendMessage: %v", err)
 		}
@@ -194,7 +384,7 @@ func TestFetchContextCacheReturnsClonedMessages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchContext: %v", err)
 	}
-	got[0].Payload["content"] = "mutated"
+	got[0].SetPayloadValue("content", "mutated")
 
 	got, err = svc.FetchContext(ctx, "thread-cache-clone", 2)
 	if err != nil {
@@ -204,8 +394,31 @@ func TestFetchContextCacheReturnsClonedMessages(t *testing.T) {
 		t.Fatalf("cached message was externally mutated, got %q", got[0].Content())
 	}
 }
+
+func TestFetchContextCacheExcludesExpiredMessages(t *testing.T) {
+	svc := synapse.NewSynapseService(10, nil)
+	ctx := context.Background()
+	if err := svc.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer svc.Close()
+
+	msg := synapse.NewContextMessage("thread-cache-expiry", "agent-1", synapse.RoleUser, "short lived", "", nil, time.Second)
+	msg.Timestamp = time.Now().Add(-2 * time.Second)
+	if _, err := svc.SendMessage(ctx, msg); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	got, err := svc.FetchContext(ctx, "thread-cache-expiry", 1)
+	if err != nil {
+		t.Fatalf("FetchContext after expiration: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("FetchContext returned %d expired cached messages", len(got))
+	}
+}
+
 func TestTaskMessageHelpers(t *testing.T) {
-	msg := synapse.NewTaskMessage("t1", "a1", "study", "reply-1", map[string]any{"q": "hello"}, "squad-1", 3600, 2)
+	msg := synapse.NewTaskMessage("t1", "a1", "study", "reply-1", map[string]any{"q": "hello"}, "squad-1", time.Hour, 2)
 	if msg.TaskType() != "study" {
 		t.Errorf("expected 'study', got %s", msg.TaskType())
 	}
@@ -221,7 +434,7 @@ func TestTaskMessageHelpers(t *testing.T) {
 }
 
 func TestCommandMessageHelpers(t *testing.T) {
-	msg := synapse.NewCommandMessage("t1", "a1", "reset", map[string]any{"force": true}, "squad-1", 3600)
+	msg := synapse.NewCommandMessage("t1", "a1", "reset", map[string]any{"force": true}, "squad-1", time.Hour)
 	if msg.Command() != "reset" {
 		t.Errorf("expected 'reset', got %s", msg.Command())
 	}
@@ -230,5 +443,153 @@ func TestCommandMessageHelpers(t *testing.T) {
 	}
 	if msg.Role != synapse.RoleSystem {
 		t.Errorf("expected system role, got %s", msg.Role)
+	}
+}
+
+func TestParentThreadIDField(t *testing.T) {
+	msg := synapse.NewContextMessage("thread-1", "agent-1", synapse.RoleUser, "test", "", nil, time.Hour)
+	if msg.ParentThreadID != "" {
+		t.Errorf("expected empty ParentThreadID, got %s", msg.ParentThreadID)
+	}
+
+	msg.ParentThreadID = "parent-thread-1"
+	if msg.ParentThreadID != "parent-thread-1" {
+		t.Errorf("expected 'parent-thread-1', got %s", msg.ParentThreadID)
+	}
+
+	// Verify it persists through JSON serialization
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("failed to marshal: %v", err)
+	}
+
+	var decoded synapse.SynapseMessage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if decoded.ParentThreadID != "parent-thread-1" {
+		t.Errorf("ParentThreadID not preserved through JSON, got %s", decoded.ParentThreadID)
+	}
+}
+
+func TestNewSynapseMessagePanicsOnEmptyThreadID(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on empty threadID, but did not panic")
+		}
+	}()
+
+	synapse.NewSynapseMessage("", "agent-1", synapse.RoleUser, synapse.ClassContextMessage)
+}
+
+func TestNewSynapseMessagePanicsOnEmptyAgentID(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on empty agentID, but did not panic")
+		}
+	}()
+
+	synapse.NewSynapseMessage("thread-1", "", synapse.RoleUser, synapse.ClassContextMessage)
+}
+
+func TestParametersReturnsDefensiveCopy(t *testing.T) {
+	original := map[string]any{
+		"key":    "value",
+		"number": 42,
+		"nested": map[string]any{"value": "original"},
+		"items":  []any{"original"},
+	}
+	msg := synapse.NewTaskMessage("thread-1", "agent-1", "task-type", "reply-thread", original, "squad-1", time.Hour, 1)
+
+	params := msg.Parameters()
+	params["key"] = "mutated"
+	params["new_key"] = "new_value"
+	params["nested"].(map[string]any)["value"] = "mutated"
+	params["items"].([]any)[0] = "mutated"
+
+	params2 := msg.Parameters()
+	if params2["key"] != "value" {
+		t.Errorf("expected original value 'value', got %v", params2["key"])
+	}
+	if params2["number"] != 42 {
+		t.Errorf("expected original number 42, got %v", params2["number"])
+	}
+	if _, exists := params2["new_key"]; exists {
+		t.Error("mutation leaked to original message")
+	}
+	if got := params2["nested"].(map[string]any)["value"]; got != "original" {
+		t.Errorf("nested map mutation leaked to original message, got %v", got)
+	}
+	if got := params2["items"].([]any)[0]; got != "original" {
+		t.Errorf("nested slice mutation leaked to original message, got %v", got)
+	}
+}
+
+func TestSynapseMessageValidateRejectsInvalidPayloads(t *testing.T) {
+	tests := []struct {
+		name        string
+		message     synapse.SynapseMessage
+		expectedErr string
+	}{
+		{
+			name: "context missing content",
+			message: func() synapse.SynapseMessage {
+				msg := synapse.NewContextMessage("thread-1", "agent-1", synapse.RoleUser, "content", "", nil, time.Hour)
+				msg.SetPayloadValue("content", 123)
+				return msg
+			}(),
+			expectedErr: "content must be a string",
+		},
+		{
+			name: "task missing task type",
+			message: func() synapse.SynapseMessage {
+				msg := synapse.NewTaskMessage("thread-1", "agent-1", "work", "reply", nil, "", time.Hour, 1)
+				msg.SetPayloadValue("task_type", "")
+				return msg
+			}(),
+			expectedErr: "task_type must be a non-empty string",
+		},
+		{
+			name: "command parameters must be an object",
+			message: func() synapse.SynapseMessage {
+				msg := synapse.NewCommandMessage("thread-1", "agent-1", "reset", nil, "", time.Hour)
+				msg.SetPayloadValue("parameters", []any{"invalid"})
+				return msg
+			}(),
+			expectedErr: "parameters must be an object",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.message.Validate()
+			if err == nil || err.Error() != test.expectedErr {
+				t.Fatalf("Validate() error = %v, want %q", err, test.expectedErr)
+			}
+		})
+	}
+}
+
+func TestSendMessageRejectsInvalidPayload(t *testing.T) {
+	ctx := context.Background()
+	svc := synapse.NewSynapseService(10, nil)
+	if err := svc.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer svc.Close()
+
+	msg := synapse.NewTaskMessage("thread-invalid", "agent-1", "work", "reply", nil, "", time.Hour, 1)
+	msg.SetPayloadValue("task_type", 42)
+	if _, err := svc.SendMessage(ctx, msg); err == nil {
+		t.Fatal("expected SendMessage to reject invalid task payload")
+	}
+
+	got, err := svc.FetchContext(ctx, "thread-invalid", 10)
+	if err != nil {
+		t.Fatalf("FetchContext: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("invalid message was exposed through context, got %d messages", len(got))
 	}
 }

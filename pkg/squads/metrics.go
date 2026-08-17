@@ -1,6 +1,7 @@
 package squads
 
 import (
+	"maps"
 	"sync"
 	"time"
 )
@@ -15,13 +16,15 @@ type AgentMetrics struct {
 	Name             string
 	Status           string // "Idle", "Running", "Waiting", "Finished"
 	Invocations      int
-	ElapsedTime      float64
+	ElapsedTime      time.Duration
 	PendingReplies   []string
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
 	LLMCalls         int
-	LLMElapsedTime   float64
+	LLMElapsedTime   time.Duration
+	RetryCount       int
+	ErrorCount       int
 }
 
 func NewAgentMetrics(agentID, name string) *AgentMetrics {
@@ -36,13 +39,15 @@ func (a *AgentMetrics) ToDict() map[string]any {
 		"name":              a.Name,
 		"status":            a.Status,
 		"invocations":       a.Invocations,
-		"elapsed_time":      round(a.ElapsedTime, 4),
+		"elapsed_time":      a.ElapsedTime,
 		"pending_replies":   append([]string{}, a.PendingReplies...),
 		"prompt_tokens":     a.PromptTokens,
 		"completion_tokens": a.CompletionTokens,
 		"total_tokens":      a.TotalTokens,
 		"llm_calls":         a.LLMCalls,
-		"llm_elapsed_time":  round(a.LLMElapsedTime, 4),
+		"llm_elapsed_time":  a.LLMElapsedTime,
+		"retry_count":       a.RetryCount,
+		"error_count":       a.ErrorCount,
 	}
 }
 
@@ -57,7 +62,7 @@ type SquadMetrics struct {
 	CompletionTokens int
 	TotalTokens      int
 	LLMCalls         int
-	LLMElapsedTime   float64
+	LLMElapsedTime   time.Duration
 }
 
 func NewSquadMetrics(squadID, name string) *SquadMetrics {
@@ -80,7 +85,7 @@ func (s *SquadMetrics) ToDict() map[string]any {
 		"completion_tokens": s.CompletionTokens,
 		"total_tokens":      s.TotalTokens,
 		"llm_calls":         s.LLMCalls,
-		"llm_elapsed_time":  round(s.LLMElapsedTime, 4),
+		"llm_elapsed_time":  s.LLMElapsedTime,
 	}
 }
 
@@ -108,7 +113,7 @@ type TransversalMetrics struct {
 	Name              string
 	Status            string
 	SuccessfulInvokes int
-	ElapsedTime       float64
+	ElapsedTime       time.Duration
 }
 
 func NewTransversalMetrics(agentID, name string) *TransversalMetrics {
@@ -123,7 +128,7 @@ func (t *TransversalMetrics) ToDict() map[string]any {
 		"name":               t.Name,
 		"status":             t.Status,
 		"successful_invokes": t.SuccessfulInvokes,
-		"elapsed_time":       round(t.ElapsedTime, 4),
+		"elapsed_time":       t.ElapsedTime,
 	}
 }
 
@@ -133,7 +138,7 @@ type CrossSquadMessageMetrics struct {
 	ToSquad    string
 	TaskType   string
 	Parameters map[string]any
-	Timestamp  float64
+	Timestamp  time.Time
 }
 
 func (c CrossSquadMessageMetrics) ToDict() map[string]any {
@@ -146,30 +151,55 @@ func (c CrossSquadMessageMetrics) ToDict() map[string]any {
 	}
 }
 
+// TaskMetrics tracks the lifecycle of one task type across an execution.
+type TaskMetrics struct {
+	TaskType  string
+	Started   int
+	Completed int
+	Failed    int
+}
+
+func (t *TaskMetrics) ToDict() map[string]any {
+	return map[string]any{
+		"task_type": t.TaskType,
+		"started":   t.Started,
+		"completed": t.Completed,
+		"failed":    t.Failed,
+	}
+}
+
 // ExecutionMetrics is the thread-safe PipelineMetrics implementation.
 type ExecutionMetrics struct {
 	mu                 sync.Mutex
 	ThreadID           string
 	Status             string
-	StartTime          float64
-	EndTime            float64
-	ElapsedTime        float64
+	StartTime          time.Time
+	EndTime            time.Time
+	ElapsedTime        time.Duration
 	Squads             map[string]*SquadMetrics
 	Observers          map[string]*ObserverMetrics
 	Transversals       map[string]*TransversalMetrics
+	Tasks              map[string]*TaskMetrics
 	CrossSquadMessages []CrossSquadMessageMetrics
 	Delegations        []map[string]any
+	RetryCount         int
+	ErrorCount         int
+	RetriesByOperation map[string]int
+	ErrorsByCategory   map[string]int
 }
 
 // NewExecutionMetrics creates a fresh metrics tracker for a thread.
 func NewExecutionMetrics(threadID string) *ExecutionMetrics {
 	return &ExecutionMetrics{
-		ThreadID:     threadID,
-		Status:       "Running",
-		StartTime:    nowSec(),
-		Squads:       make(map[string]*SquadMetrics),
-		Observers:    make(map[string]*ObserverMetrics),
-		Transversals: make(map[string]*TransversalMetrics),
+		ThreadID:           threadID,
+		Status:             "Running",
+		StartTime:          time.Now(),
+		Squads:             make(map[string]*SquadMetrics),
+		Observers:          make(map[string]*ObserverMetrics),
+		Transversals:       make(map[string]*TransversalMetrics),
+		Tasks:              make(map[string]*TaskMetrics),
+		RetriesByOperation: make(map[string]int),
+		ErrorsByCategory:   make(map[string]int),
 	}
 }
 
@@ -201,8 +231,8 @@ func (e *ExecutionMetrics) Finalize(status string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.Status = status
-	e.EndTime = nowSec()
-	e.ElapsedTime = e.EndTime - e.StartTime
+	e.EndTime = time.Now()
+	e.ElapsedTime = e.EndTime.Sub(e.StartTime)
 	for _, s := range e.Squads {
 		if s.Status == "Running" {
 			s.Status = "Finished"
@@ -260,6 +290,18 @@ func (e *ExecutionMetrics) ensureAgentLocked(squadID, agentID string) *AgentMetr
 	return a
 }
 
+func (e *ExecutionMetrics) ensureTaskLocked(taskType string) *TaskMetrics {
+	if taskType == "" {
+		taskType = "unspecified"
+	}
+	task, ok := e.Tasks[taskType]
+	if !ok {
+		task = &TaskMetrics{TaskType: taskType}
+		e.Tasks[taskType] = task
+	}
+	return task
+}
+
 func (e *ExecutionMetrics) RecordSubagentStart(squadID, agentID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -269,7 +311,7 @@ func (e *ExecutionMetrics) RecordSubagentStart(squadID, agentID string) {
 	a.Invocations++
 }
 
-func (e *ExecutionMetrics) RecordSubagentEnd(squadID, agentID string, elapsed float64) {
+func (e *ExecutionMetrics) RecordSubagentEnd(squadID, agentID string, elapsed time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if s, ok := e.Squads[squadID]; ok {
@@ -315,7 +357,7 @@ func (e *ExecutionMetrics) RecordSubagentResumed(squadID, agentID, replyThreadID
 	a.PendingReplies = out
 }
 
-func (e *ExecutionMetrics) AddSubagentElapsedTime(squadID, agentID string, elapsed float64) {
+func (e *ExecutionMetrics) AddSubagentElapsedTime(squadID, agentID string, elapsed time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if s, ok := e.Squads[squadID]; ok {
@@ -333,7 +375,7 @@ func (e *ExecutionMetrics) RecordCrossSquadMessage(fromAgent, toSquad, taskType 
 		ToSquad:    toSquad,
 		TaskType:   taskType,
 		Parameters: parameters,
-		Timestamp:  nowSec(),
+		Timestamp:  time.Now(),
 	})
 }
 
@@ -345,8 +387,52 @@ func (e *ExecutionMetrics) RecordDelegation(source, destination, delegationType 
 		"destination": destination,
 		"type":        delegationType,
 		"parameters":  parameters,
-		"timestamp":   nowSec(),
+		"timestamp":   time.Now(),
 	})
+}
+
+func (e *ExecutionMetrics) RecordTaskStarted(taskType string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ensureTaskLocked(taskType).Started++
+}
+
+func (e *ExecutionMetrics) RecordTaskCompleted(taskType string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ensureTaskLocked(taskType).Completed++
+}
+
+func (e *ExecutionMetrics) RecordTaskFailed(taskType string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ensureTaskLocked(taskType).Failed++
+}
+
+func (e *ExecutionMetrics) RecordRetry(squadID, agentID, operation string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.RetryCount++
+	if operation == "" {
+		operation = "unspecified"
+	}
+	e.RetriesByOperation[operation]++
+	if squadID != "" && agentID != "" {
+		e.ensureAgentLocked(squadID, agentID).RetryCount++
+	}
+}
+
+func (e *ExecutionMetrics) RecordError(squadID, agentID, category string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ErrorCount++
+	if category == "" {
+		category = "unspecified"
+	}
+	e.ErrorsByCategory[category]++
+	if squadID != "" && agentID != "" {
+		e.ensureAgentLocked(squadID, agentID).ErrorCount++
+	}
 }
 
 func (e *ExecutionMetrics) RecordTransversalStart(agentID string) {
@@ -360,7 +446,7 @@ func (e *ExecutionMetrics) RecordTransversalStart(agentID string) {
 	t.Status = "Running"
 }
 
-func (e *ExecutionMetrics) RecordTransversalSuccess(agentID string, elapsed float64) {
+func (e *ExecutionMetrics) RecordTransversalSuccess(agentID string, elapsed time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if t, ok := e.Transversals[agentID]; ok {
@@ -370,7 +456,7 @@ func (e *ExecutionMetrics) RecordTransversalSuccess(agentID string, elapsed floa
 	}
 }
 
-func (e *ExecutionMetrics) RecordTransversalFailure(agentID string, elapsed float64) {
+func (e *ExecutionMetrics) RecordTransversalFailure(agentID string, elapsed time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if t, ok := e.Transversals[agentID]; ok {
@@ -390,7 +476,7 @@ func (e *ExecutionMetrics) RecordObserverInteraction(observerName string) {
 	o.Interactions++
 }
 
-func (e *ExecutionMetrics) RecordLLMUsage(squadID, agentID string, prompt, completion, total int, elapsed float64) {
+func (e *ExecutionMetrics) RecordLLMUsage(squadID, agentID string, prompt, completion, total int, elapsed time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if s, ok := e.Squads[squadID]; ok {
@@ -404,7 +490,7 @@ func (e *ExecutionMetrics) RecordLLMUsage(squadID, agentID string, prompt, compl
 	}
 }
 
-func (e *ExecutionMetrics) RecordCoordinatorUsage(squadID string, prompt, completion, total int, elapsed float64) {
+func (e *ExecutionMetrics) RecordCoordinatorUsage(squadID string, prompt, completion, total int, elapsed time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if s, ok := e.Squads[squadID]; ok {
@@ -431,37 +517,33 @@ func (e *ExecutionMetrics) ToDict() map[string]any {
 	for tid, tm := range e.Transversals {
 		transversals[tid] = tm.ToDict()
 	}
+	tasks := make(map[string]any, len(e.Tasks))
+	for taskType, task := range e.Tasks {
+		tasks[taskType] = task.ToDict()
+	}
 	cross := make([]map[string]any, 0, len(e.CrossSquadMessages))
 	for _, c := range e.CrossSquadMessages {
 		cross = append(cross, c.ToDict())
 	}
 	elapsed := e.ElapsedTime
-	if e.EndTime == 0 {
-		elapsed = nowSec() - e.StartTime
+	if e.EndTime.IsZero() {
+		elapsed = time.Since(e.StartTime)
 	}
 	return map[string]any{
 		"thread_id":            e.ThreadID,
 		"status":               e.Status,
 		"start_time":           e.StartTime,
 		"end_time":             e.EndTime,
-		"elapsed_time":         round(elapsed, 4),
+		"elapsed_time":         elapsed,
 		"squads":               squads,
 		"observers":            observers,
 		"transversals":         transversals,
+		"tasks":                tasks,
 		"cross_squad_messages": cross,
 		"delegations":          e.Delegations,
+		"retry_count":          e.RetryCount,
+		"retries_by_operation": maps.Clone(e.RetriesByOperation),
+		"error_count":          e.ErrorCount,
+		"errors_by_category":   maps.Clone(e.ErrorsByCategory),
 	}
-}
-
-func nowSec() float64 {
-	return float64(time.Now().UnixNano()) / 1e9
-}
-
-// round truncates to a fixed number of decimals for stable metric output.
-func round(v float64, decimals int) float64 {
-	mul := 1.0
-	for i := 0; i < decimals; i++ {
-		mul *= 10
-	}
-	return float64(int(v*mul)) / mul
 }

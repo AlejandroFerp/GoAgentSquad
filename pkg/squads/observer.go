@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
@@ -18,28 +19,35 @@ type ObserverCallback func(ctx context.Context, msg synapse.SynapseMessage) (*sy
 // BaseObserver subscribes to pre_insert events matching a pattern and delegates
 // processing to a concrete observer.
 type BaseObserver struct {
-	Pattern    string
-	Blackboard BlackboardBus
-	Subscribed bool
-	process    func(ctx context.Context, msg *synapse.SynapseMessage) (*synapse.SynapseMessage, error)
+	Pattern      string
+	Blackboard   BlackboardBus
+	mu           sync.Mutex
+	subscribed   bool
+	process      func(ctx context.Context, msg *synapse.SynapseMessage) (*synapse.SynapseMessage, error)
+	subscription synapse.SubscriptionID
 }
 
 // Start subscribes the observer to the pre_insert EventBus hook.
 func (o *BaseObserver) Start() {
-	if o.Subscribed {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.subscribed {
 		return
 	}
-	o.Blackboard.Events().Subscribe(o.Pattern, synapse.PreInsertCallback(o.onPreInsert), "pre_insert")
-	o.Subscribed = true
+	o.subscription = o.Blackboard.Events().SubscribePreInsert(o.Pattern, o.onPreInsert)
+	o.subscribed = true
 }
 
 // Stop unsubscribes the observer.
 func (o *BaseObserver) Stop() {
-	if !o.Subscribed {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.subscribed {
 		return
 	}
-	o.Blackboard.Events().Unsubscribe(synapse.PreInsertCallback(o.onPreInsert))
-	o.Subscribed = false
+	o.Blackboard.Events().Unsubscribe(o.subscription)
+	o.subscription = 0
+	o.subscribed = false
 }
 
 func (o *BaseObserver) onPreInsert(ctx context.Context, msg synapse.SynapseMessage) (*synapse.SynapseMessage, error) {
@@ -120,8 +128,8 @@ func (r *ReferenceExpansionObserver) process(ctx context.Context, msg *synapse.S
 
 	if len(expandedParts) > 0 {
 		suffix := "\n\n---\n**Expanded References:**\n" + strings.Join(expandedParts, "\n")
-		msg.Payload["content"] = content + suffix
-		msg.Payload["citations"] = citations
+		msg.SetPayloadValue("content", content+suffix)
+		msg.SetPayloadValue("citations", citations)
 	}
 	return msg, nil
 }

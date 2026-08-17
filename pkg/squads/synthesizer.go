@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/embention/agent-squad-go/pkg/synapse"
 )
@@ -14,10 +16,12 @@ import (
 // Synthesizer monitors context growth and compacts history when a threshold is
 // exceeded, posting a synthesis checkpoint message that slices future fetches.
 type Synthesizer struct {
-	Blackboard BlackboardBus
-	Threshold  int
-	Summarize  func(messages []synapse.SynapseMessage) string
-	Subscribed bool
+	Blackboard   BlackboardBus
+	Threshold    int
+	Summarize    func(messages []synapse.SynapseMessage) string
+	mu           sync.Mutex
+	subscribed   bool
+	subscription synapse.SubscriptionID
 }
 
 // NewSynthesizer builds a Synthesizer with a default summarizer.
@@ -33,20 +37,25 @@ func NewSynthesizer(bb BlackboardBus, threshold int, summarize func([]synapse.Sy
 
 // Start subscribes the synthesizer to post_insert events.
 func (s *Synthesizer) Start() {
-	if s.Subscribed {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.subscribed {
 		return
 	}
-	s.Blackboard.Events().Subscribe("*", synapse.PostInsertCallback(s.onPostInsert), "post_insert")
-	s.Subscribed = true
+	s.subscription = s.Blackboard.Events().SubscribePostInsert("*", s.onPostInsert)
+	s.subscribed = true
 }
 
 // Stop unsubscribes the synthesizer.
 func (s *Synthesizer) Stop() {
-	if !s.Subscribed {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.subscribed {
 		return
 	}
-	s.Blackboard.Events().Unsubscribe(synapse.PostInsertCallback(s.onPostInsert))
-	s.Subscribed = false
+	s.Blackboard.Events().Unsubscribe(s.subscription)
+	s.subscription = 0
+	s.subscribed = false
 }
 
 func (s *Synthesizer) onPostInsert(ctx context.Context, msg synapse.SynapseMessage) {
@@ -54,7 +63,7 @@ func (s *Synthesizer) onPostInsert(ctx context.Context, msg synapse.SynapseMessa
 		return
 	}
 	if msg.Role == synapse.RoleSystem {
-		if isSynth, ok := msg.Payload["is_synthesis"].(bool); ok && isSynth {
+		if isSynth, ok := msg.GetPayloadValue("is_synthesis"); ok && isSynth == true {
 			return
 		}
 	}
@@ -66,7 +75,7 @@ func (s *Synthesizer) onPostInsert(ctx context.Context, msg synapse.SynapseMessa
 	nonSynthCount := 0
 	for _, m := range active {
 		if m.Role == synapse.RoleSystem {
-			if isSynth, ok := m.Payload["is_synthesis"].(bool); ok && isSynth {
+			if isSynth, ok := m.GetPayloadValue("is_synthesis"); ok && isSynth == true {
 				continue
 			}
 		}
@@ -75,22 +84,16 @@ func (s *Synthesizer) onPostInsert(ctx context.Context, msg synapse.SynapseMessa
 	if nonSynthCount >= s.Threshold {
 		summary := s.Summarize(active)
 		synthMsg := synapse.NewContextMessage(threadID, "synthesizer", synapse.RoleSystem,
-			fmt.Sprintf("[SYNTHESIS CHECKPOINT] %s", summary), msg.SquadID, nil, 3600*24)
-		synthMsg.Payload["is_synthesis"] = true
-		_, _ = s.Blackboard.SendMessage(ctx, synthMsg)
+			fmt.Sprintf("[SYNTHESIS CHECKPOINT] %s", summary), msg.SquadID, nil, 24*time.Hour)
+		synthMsg.SetPayloadValue("is_synthesis", true)
+		_ = deliverObserved(ctx, s.Blackboard, synthMsg, "threshold", s.Threshold)
 	}
 }
 
 func defaultSummarize(messages []synapse.SynapseMessage) string {
 	var parts []string
 	for _, m := range messages {
-		snippet := m.Content()
-		if len(snippet) > 30 {
-			snippet = snippet[:30] + "..."
-		}
-		if snippet == "" {
-			snippet = ""
-		}
+		snippet := truncateRunes(m.Content(), 30)
 		parts = append(parts, fmt.Sprintf("%s(%s): %s", m.Role, m.AgentID, snippet))
 	}
 	return "Summary of active discussion: " + strings.Join(parts, " | ")
