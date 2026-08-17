@@ -51,7 +51,7 @@ type manualLink struct {
 	LatestURL      string `json:"latest_url,omitempty"`
 	ProductVersion string `json:"product_version,omitempty"`
 	ManualVersion  string `json:"manual_version,omitempty"`
-	IsLatest       bool   `json:"is_latest,omitempty"`
+	IsLatest       bool   `json:"is_latest"`
 }
 
 type manualSection struct {
@@ -161,6 +161,8 @@ type manualPageExtract struct {
 	ManualVersion   string          `json:"manual_version,omitempty"`
 	Title           string          `json:"title"`
 	Status          string          `json:"status"`
+	LatestURL       string          `json:"latest_url,omitempty"`
+	IsLatest        bool            `json:"is_latest"`
 	Sections        []manualSection `json:"sections,omitempty"`
 	KeywordsFound   []string        `json:"keywords_found,omitempty"`
 	EvidenceWindows []string        `json:"evidence_windows,omitempty"`
@@ -385,7 +387,7 @@ func (crawler *manualCrawler) expandManualVersions(manuals []manualLink) ([]manu
 			expanded = append(expanded, manual)
 			continue
 		}
-		latestProductVersion, latestManualVersion, hasLatestVersion := parseManualVersionLabel(string(body))
+		latestProductVersion, latestManualVersion, hasLatestVersion := matchManualVersion(versions, string(body))
 		for versionIndex := range versions {
 			versions[versionIndex].IsLatest = hasLatestVersion && versions[versionIndex].ProductVersion == latestProductVersion && versions[versionIndex].ManualVersion == latestManualVersion
 		}
@@ -458,6 +460,28 @@ func parseManualVersionLabel(text string) (string, string, bool) {
 	}
 	productVersion, manualVersion, ok := strings.Cut(match, manualVersionSeparator)
 	return productVersion, manualVersion, ok
+}
+
+func matchManualVersion(versions []manualLink, text string) (string, string, bool) {
+	productVersion, manualVersion, ok := parseManualVersionLabel(text)
+	if !ok {
+		return "", "", false
+	}
+	for _, version := range versions {
+		if version.ProductVersion == productVersion && version.ManualVersion == manualVersion {
+			return productVersion, manualVersion, true
+		}
+	}
+	parts := strings.Split(productVersion, ".")
+	for start := 1; start < len(parts); start++ {
+		candidateProductVersion := strings.Join(parts[start:], ".")
+		for _, version := range versions {
+			if version.ProductVersion == candidateProductVersion && version.ManualVersion == manualVersion {
+				return candidateProductVersion, manualVersion, true
+			}
+		}
+	}
+	return "", "", false
 }
 
 func isManualVersionRootURL(pageURL string) bool {
@@ -641,6 +665,8 @@ func pageExtract(page manualPage) manualPageExtract {
 		ManualVersion:   page.Link.ManualVersion,
 		Title:           page.Link.Title,
 		Status:          status,
+		LatestURL:       page.Link.LatestURL,
+		IsLatest:        page.Link.IsLatest,
 		Sections:        append([]manualSection(nil), page.Sections...),
 		KeywordsFound:   append([]string(nil), page.Keywords...),
 		EvidenceWindows: append([]string(nil), page.Windows...),

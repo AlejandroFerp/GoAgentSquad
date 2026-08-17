@@ -36,7 +36,6 @@ flowchart LR
 ```
 agent-squad-go/
 ├── cmd/
-│   ├── squad-demo/           # End-to-end demo with optional dashboard, JSONL, and OTel
 │   └── squad-dashboard/      # Standalone dashboard for live or persisted traces
 ├── pkg/
 │   ├── dashboard/            # REST API, SSE stream, embedded UI, graph/metrics projections
@@ -58,10 +57,8 @@ The following map connects the user-facing capabilities with the Go packages tha
 
 ```mermaid
 flowchart TB
-	Config["pkg/config\nViper configuration"] --> Demo["cmd/squad-demo\nApplication wiring"]
-	Config --> Standalone["cmd/squad-dashboard\nStandalone trace viewer"]
-	Demo --> Runtime["pkg/squads/runtime.go\nProvider-neutral Runtime"]
-	Runtime --> Pipeline["pkg/squads/pipeline.go\nRouting, lifecycle, quiescence"]
+	Config["pkg/config\nViper configuration"] --> Standalone["cmd/squad-dashboard\nStandalone trace viewer"]
+	Runtime["pkg/squads/runtime.go\nProvider-neutral Runtime"] --> Pipeline["pkg/squads/pipeline.go\nRouting, lifecycle, quiescence"]
 	Pipeline --> Squad["pkg/squads/squad.go\nConcurrent squad coordination"]
 	Squad --> Agent["pkg/squads/agent.go\nLLM, tools, delegation"]
 	Pipeline --> Blackboard["pkg/squads/blackboard.go\nSynapse adapter"]
@@ -91,7 +88,6 @@ flowchart TB
 | External telemetry | `pkg/observability/tracer.go`, `otel_runtime.go` | Supplies noop, recorder, and optional OpenTelemetry tracing implementations. | `tests/observability` |
 | Dashboard projections | `pkg/dashboard/api.go`, `graph.go`, `sse.go` | Serves query timelines, workflow graphs, metrics, embedded assets, and live `AgentStep` events. | `tests/dashboard` |
 | Dashboard frontend | `pkg/dashboard/web/` | Renders Mermaid Sequence, State, Mindmap, and Flowchart views with chronological events, query drawer, timeline, metrics, logs, tooltips, PNG export, and participant inspector from read-only projections. | `node --check pkg/dashboard/web/app.js`, `tests/e2e` |
-| End-to-end demo | `cmd/squad-demo/main.go` | Demonstrates provider-neutral wiring with optional dashboard, JSONL, and OpenTelemetry integrations. | `go run ./cmd/squad-demo/` |
 | Manual compatibility experiment | `local-tests/use-case/` | Runs four declarative squads for manual discovery, concurrent evidence ingestion, compatibility synthesis, and reporting without adding domain behavior to core packages. | Nested module tests and mock run |
 
 ## Package Responsibilities
@@ -252,7 +248,10 @@ The minimum application-owned contracts are:
 - `squads.TransversalAgent.ExecuteTask`: receives a `SynapseMessage` and returns the delegated task result.
 - `squads.LocalTool.Func`: receives a `map[string]any` of arguments and returns a result or error.
 
-The demo in `cmd/squad-demo/main.go` is the canonical wiring example. Its `mockLLMCall` can be replaced with an adapter for the application's model provider without changing the pipeline, Synapse, or dashboard packages.
+The flagship wiring example is the manual compatibility experiment under `local-tests/use-case/`, which registers
+four declarative squads and a deterministic transversal through `squads.NewRuntime`. Its `mockLLMCall` can be
+replaced with an adapter for the application's model provider without changing the pipeline, Synapse, or dashboard
+packages.
 
 ### Component Registration Order
 
@@ -375,37 +374,19 @@ The query thread ID is also the default correlation ID. Child threads are linked
 
 ## Running
 
-```bash
-go run ./cmd/squad-demo/
-```
-
-Optional runtime flags and environment variables:
-
-- `SQUAD_DASHBOARD_ADDR` starts the embedded observability dashboard inside the demo process.
-- `SQUAD_TRACE_JSONL` exports each completed query timeline to a JSONL file for later inspection.
-- `SQUAD_OTEL_ENABLED` turns on the OpenTelemetry tracer runtime in the demo.
-- `SQUAD_OTEL_ENDPOINT` points the OTLP gRPC exporter at a collector such as `127.0.0.1:4317`.
-- `SQUAD_OTEL_INSECURE` disables TLS for local collectors.
-- `SQUAD_OTEL_HEADERS` sets OTLP headers as a comma-separated `key=value` list.
-- `SQUAD_OTEL_SERVICE_NAME`, `SQUAD_OTEL_SERVICE_VERSION`, and `SQUAD_OTEL_TRACER_NAME` override the default resource and tracer identity.
-- `SQUAD_OTEL_BATCH_TIMEOUT` overrides the span batch timeout using Go duration syntax such as `250ms` or `2s`.
-
-Example workflow:
-
-1. Run the demo with a shared in-process dashboard.
-2. Enable `SQUAD_TRACE_JSONL` when you want durable traces.
-3. Enable `SQUAD_OTEL_ENABLED` plus an OTLP endpoint when you want the same spans exported to an external collector.
-4. Open the standalone dashboard against the exported file when you want to inspect traces outside the demo process.
-
-Example with both JSONL replay and OTLP export enabled:
+The flagship example is the manual compatibility experiment under `local-tests/use-case/`. Run its
+deterministic mock mode without any provider credentials:
 
 ```powershell
-$env:SQUAD_TRACE_JSONL = ".\\traces\\agent-steps.jsonl"
-$env:SQUAD_OTEL_ENABLED = "true"
-$env:SQUAD_OTEL_ENDPOINT = "127.0.0.1:4317"
-$env:SQUAD_OTEL_INSECURE = "true"
-go run ./cmd/squad-demo/
+Push-Location .\local-tests\use-case
+.\run.ps1 --mock --exit-after-run
+Pop-Location
 ```
+
+For a live run against `https://manuals.embention.com/`, create an experiment-local `.env` with
+`OPENROUTER_API_KEY` and `OPENROUTER_MODEL`, then omit `--mock`. The experiment supports `--scope`
+(`1x` by default, or `all`) and `--all-versions` to include historical manual versions, plus a
+`--verifier-model` override for the candidate verification model.
 
 Standalone dashboard:
 

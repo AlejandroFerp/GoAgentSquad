@@ -128,13 +128,14 @@ func (b *BaseAgent) Respond(ctx context.Context, threadID, content string, citat
 type SubAgent struct {
 	BaseAgent
 
-	AgentType    string
-	Description  string
-	SystemPrompt string
-	Model        string
-	LLMCall      LLMCall
-	ToolMaxRetry int
-	ResumeFn     func(ctx context.Context, replyThreadID string, replyMsg *synapse.SynapseMessage, context map[string]any) error
+	AgentType     string
+	Description   string
+	SystemPrompt  string
+	Model         string
+	LLMCall       LLMCall
+	ToolMaxRetry  int
+	ResumeFn      func(ctx context.Context, replyThreadID string, replyMsg *synapse.SynapseMessage, context map[string]any) error
+	ResumeWithLLM bool
 
 	ExcludedTransversals []string
 	ExcludedSquads       []string
@@ -599,13 +600,7 @@ func (a *SubAgent) HandleReply(ctx context.Context, replyThreadID string, replyM
 			"task_type":         resumptionCtx.TaskType,
 			"parameters":        resumptionCtx.Parameters,
 		}); err != nil {
-			observedLogger(ctx, a.Blackboard).Error("agent resume failed",
-				"agent_id", a.AgentID,
-				"agent_type", a.AgentType,
-				"squad_id", a.SquadID,
-				"reply_thread_id", replyThreadID,
-				"error", err,
-			)
+			a.recordResumeFailure(ctx, metrics, replyThreadID, err)
 		}
 		return
 	}
@@ -613,9 +608,32 @@ func (a *SubAgent) HandleReply(ctx context.Context, replyThreadID string, replyM
 	if respondThreadID == "" {
 		respondThreadID = origThread
 	}
+	if a.ResumeWithLLM {
+		replyContent := ""
+		if replyMsg != nil {
+			replyContent = replyMsg.Content()
+		}
+		if err := a.RunReasoningLoop(ctx, origThread, replyContent, respondThreadID); err != nil {
+			a.recordResumeFailure(ctx, metrics, replyThreadID, err)
+		}
+		return
+	}
 	if replyMsg != nil {
 		a.respondObserved(ctx, respondThreadID, replyMsg.Content())
 	}
+}
+
+func (a *SubAgent) recordResumeFailure(ctx context.Context, metrics PipelineMetrics, replyThreadID string, err error) {
+	if metrics != nil {
+		metrics.RecordError(a.SquadID, a.AgentID, "resume")
+	}
+	observedLogger(ctx, a.Blackboard).Error("agent resume failed",
+		"agent_id", a.AgentID,
+		"agent_type", a.AgentType,
+		"squad_id", a.SquadID,
+		"reply_thread_id", replyThreadID,
+		"error", err,
+	)
 }
 
 func (a *SubAgent) injectToolDefinitions(systemPrompt string) string {

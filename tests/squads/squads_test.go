@@ -764,6 +764,53 @@ func TestSubAgentHandleReplyRoutesPendingReply(t *testing.T) {
 	}
 }
 
+func TestSubAgentHandleReplyResumesWithLLM(t *testing.T) {
+	_, bb, _ := setupPipeline(t)
+	ctx := context.Background()
+	agent := squads.NewSubAgent("resume-agent", "ResumeAgent", "desc", "system", bb, "resume-squad")
+	agent.ResumeWithLLM = true
+	var calls int
+	var receivedReply bool
+	agent.LLMCall = func(_ context.Context, _ string, _ string, messages []map[string]any) (squads.LLMResponse, error) {
+		calls++
+		for _, message := range messages {
+			content, _ := message["content"].(string)
+			if strings.Contains(content, "lookup result") {
+				receivedReply = true
+			}
+		}
+		return squads.LLMResponse{Content: "resumed answer"}, nil
+	}
+
+	if _, err := agent.CallToolDelegate(
+		ctx,
+		"original-thread",
+		"lookup",
+		"reply-thread",
+		map[string]any{"query": "test"},
+		"",
+		"response-thread",
+	); err != nil {
+		t.Fatalf("CallToolDelegate: %v", err)
+	}
+	reply := synapse.NewContextMessage("reply-thread", "transversal", synapse.RoleAssistant, "lookup result", "", nil, time.Hour)
+	agent.HandleReply(ctx, "reply-thread", &reply)
+
+	if calls != 1 {
+		t.Fatalf("LLM calls = %d, want one resumed reasoning call", calls)
+	}
+	if !receivedReply {
+		t.Fatal("resumed reasoning call did not receive the delegated reply")
+	}
+	responses, err := bb.FetchContext(ctx, "response-thread", 10)
+	if err != nil {
+		t.Fatalf("FetchContext: %v", err)
+	}
+	if len(responses) != 1 || responses[0].Content() != "resumed answer" {
+		t.Fatalf("response thread = %#v, want one resumed answer", responses)
+	}
+}
+
 func TestSubAgentDelegateCreatesDistinctReplyThread(t *testing.T) {
 	_, bb, _ := setupPipeline(t)
 	originalThreadID := "agent-thread"

@@ -2,27 +2,18 @@ plan.md
 .serena
 MULTI_AGENT_RAG_PLAN.md
 .env
-
-# Keep only the real public Embention manuals web-scraping harness.
 local-tests/*
 !local-tests/
 !local-tests/use-case/
-local-tests/use-case/*
-!local-tests/use-case/.env.example
-!local-tests/use-case/config.go
-!local-tests/use-case/dashboard.go
-!local-tests/use-case/experiment.go
-!local-tests/use-case/go.mod
-!local-tests/use-case/go.sum
-!local-tests/use-case/main.go
-!local-tests/use-case/manual_audit.go
-!local-tests/use-case/manual_report.go
-!local-tests/use-case/openrouter.go
-!local-tests/use-case/run.ps1
-
-# Local editor state.
-.vscode/
-
+!local-tests/use-case/**
+local-tests/use-case/.env
+local-tests/use-case/article.md
+local-tests/use-case/*-article.md
+local-tests/use-case/mock-*.md
+local-tests/use-case/real-*
+local-tests/use-case/manual-audit-report.md
+local-tests/use-case/manual-vs-product.json
+local-tests/use-case/compatibility-matrix.md
 node_modules/
 test-results/
 playwright-report/

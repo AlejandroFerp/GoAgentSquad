@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/embention/agent-squad-go/pkg/synapse"
 )
 
 func TestExecutionBudgetValidate(t *testing.T) {
@@ -89,6 +91,69 @@ func TestNewRuntimeRejectsInvalidExecutionBudget(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), "execution budget") {
 		t.Fatalf("NewRuntime() error = %v, want execution budget validation error", err)
+	}
+}
+
+func TestNewRuntimeRejectsInvalidTransversalDefinitions(t *testing.T) {
+	executeTask := func(context.Context, *synapse.SynapseMessage) (string, error) {
+		return "ok", nil
+	}
+	tests := []struct {
+		name          string
+		transversals  []TransversalDefinition
+		wantErrorText string
+	}{
+		{
+			name: "empty ID",
+			transversals: []TransversalDefinition{{
+				Capabilities: []string{"lookup"}, ExecuteTask: executeTask,
+			}},
+			wantErrorText: "ID must not be empty",
+		},
+		{
+			name: "empty capabilities",
+			transversals: []TransversalDefinition{{
+				ID: "lookup", ExecuteTask: executeTask,
+			}},
+			wantErrorText: "requires at least one capability",
+		},
+		{
+			name: "empty capability value",
+			transversals: []TransversalDefinition{{
+				ID: "lookup", Capabilities: []string{""}, ExecuteTask: executeTask,
+			}},
+			wantErrorText: "contains an empty capability",
+		},
+		{
+			name: "nil ExecuteTask",
+			transversals: []TransversalDefinition{{
+				ID: "lookup", Capabilities: []string{"lookup"},
+			}},
+			wantErrorText: "requires an ExecuteTask function",
+		},
+		{
+			name: "duplicate ID",
+			transversals: []TransversalDefinition{
+				{ID: "lookup", Capabilities: []string{"lookup"}, ExecuteTask: executeTask},
+				{ID: "lookup", Capabilities: []string{"other"}, ExecuteTask: executeTask},
+			},
+			wantErrorText: "duplicate transversal ID",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime, err := NewRuntime(context.Background(), RuntimeConfig{
+				Transversals: test.transversals,
+			})
+			if runtime != nil {
+				_ = runtime.Close()
+				t.Fatal("NewRuntime returned a runtime for an invalid transversal definition")
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErrorText) {
+				t.Fatalf("NewRuntime() error = %v, want substring %q", err, test.wantErrorText)
+			}
+		})
 	}
 }
 

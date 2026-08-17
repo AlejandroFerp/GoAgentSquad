@@ -11,10 +11,12 @@ import (
 )
 
 const (
-	discoverySquadID = "manual-discovery"
-	ingestionSquadID = "manual-ingestion"
-	synthesisSquadID = "manual-synthesis"
-	reportingSquadID = "manual-reporting"
+	discoverySquadID         = "manual-discovery"
+	ingestionSquadID         = "manual-ingestion"
+	synthesisSquadID         = "manual-synthesis"
+	reportingSquadID         = "manual-reporting"
+	manualEvidenceIndexID    = "manual-evidence-index"
+	manualEvidenceCapability = "get_shared_compatibility_evidence"
 )
 
 type experiment struct {
@@ -35,6 +37,7 @@ type experimentResult struct {
 	Report            string
 	DiscoveryQuery    string
 	IngestionQuery    string
+	SynthesisMetrics  map[string]any
 	SynthesisQuery    string
 	ReportingQuery    string
 }
@@ -52,6 +55,15 @@ func newExperiment(ctx context.Context, cfg config, llm squads.LLMCall) (*experi
 		LLMCall:           llm,
 		CaptureLLMContent: cfg.CaptureLLMContent,
 		Squads:            definitions,
+		Transversals: []squads.TransversalDefinition{
+			{
+				ID:           manualEvidenceIndexID,
+				Type:         "MANUAL_EVIDENCE_INDEX",
+				Description:  "Returns shared versioned manual evidence and compatibility candidates.",
+				Capabilities: []string{manualEvidenceCapability},
+				ExecuteTask:  manualEvidenceIndexTask(memory),
+			},
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create declarative runtime: %w", err)
@@ -147,14 +159,15 @@ Scoped inventory:
 		appendManualIssue(&inventory, "synthesis", "", err)
 	} else {
 		result.Draft = draftFromHistory(synthesis.History)
+		result.SynthesisMetrics = synthesis.Metrics
 	}
 	if len(result.Draft.Relationships) == 0 {
 		result.Draft = draftFromEvidence(result.Evidence)
 	}
 	result.Draft = enrichDraftFromCandidates(result.Draft, candidates)
 	result.Draft = ensureCandidateCoverage(result.Draft, candidates)
-
 	draftJSON := mustJSON(result.Draft)
+
 	result.ReportingQuery = fmt.Sprintf("manual-reporting-%d", time.Now().UnixNano())
 	reportingPrompt := fmt.Sprintf(`You are the Data Formatter in Squad 4. Audit the verified candidate relationships below without dropping or collapsing any relationship.
 Preserve exact product and manual versions, direct Embention section URLs, and verbatim evidence quotes. Do not use web search, invent compatibility, or replace versioned URLs with latest aliases. Return ONLY JSON matching this shape:
@@ -230,12 +243,13 @@ func makeManualVerifierDefinitions(crawler *manualCrawler, memory *manualMemory,
 	for verifierIndex := 0; verifierIndex < verifierCount; verifierIndex++ {
 		verifierTools := manualTools(crawler, memory, verifierIndex, verifierCount)
 		definitions = append(definitions, squads.AgentDefinition{
-			ID:           fmt.Sprintf("compatibility-verifier-%02d", verifierIndex+1),
-			Type:         "COMPATIBILITY_VERIFIER",
-			Description:  fmt.Sprintf("Verifies candidate relationship shard %d of %d against direct Embention evidence.", verifierIndex+1, verifierCount),
-			SystemPrompt: fmt.Sprintf("MANUAL_VERIFIER\nYou are compatibility verifier shard %d of %d. Use verify_candidate_edges exactly once. Verify every assigned candidate independently, preserve all candidates in the JSON response, and use only direct Embention manual evidence.", verifierIndex+1, verifierCount),
-			Model:        model,
-			Tools:        toolSubset(verifierTools, "verify_candidate_edges"),
+			ID:            fmt.Sprintf("compatibility-verifier-%02d", verifierIndex+1),
+			Type:          "COMPATIBILITY_VERIFIER",
+			Description:   fmt.Sprintf("Verifies candidate relationship shard %d of %d against direct Embention evidence.", verifierIndex+1, verifierCount),
+			SystemPrompt:  fmt.Sprintf("MANUAL_VERIFIER\nYou are compatibility verifier shard %d of %d. First call delegate_transversal_%s with {\"query\":\"all\"}. After the shared evidence reply, call verify_candidate_edges exactly once. Verify every assigned candidate independently, preserve all candidates in the JSON response, and use only direct Embention manual evidence.", verifierIndex+1, verifierCount, manualEvidenceCapability),
+			Model:         model,
+			ResumeWithLLM: true,
+			Tools:         toolSubset(verifierTools, "verify_candidate_edges"),
 		})
 	}
 	return definitions

@@ -23,6 +23,16 @@ type AgentDefinition struct {
 	ExcludedSquads       []string
 	ExcludedTasks        []string
 	ExcludedTransversals []string
+	ResumeWithLLM        bool
+}
+
+// TransversalDefinition declares a shared deterministic task service.
+type TransversalDefinition struct {
+	ID           string
+	Type         string
+	Description  string
+	Capabilities []string
+	ExecuteTask  func(ctx context.Context, taskMsg *synapse.SynapseMessage) (string, error)
 }
 
 // SquadDefinition declares a named group of agents.
@@ -46,6 +56,7 @@ type RuntimeConfig struct {
 	FinalSynthesizer  FinalSynthesizer
 	RouteQueryFn      func(ctx context.Context, content string) ([]string, error)
 	Squads            []SquadDefinition
+	Transversals      []TransversalDefinition
 }
 
 // Runtime owns the infrastructure required to execute declaratively defined squads.
@@ -59,6 +70,9 @@ type Runtime struct {
 func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	if err := cfg.ExecutionBudget.Validate(); err != nil {
 		return nil, fmt.Errorf("validate runtime execution budget: %w", err)
+	}
+	if err := validateTransversalDefinitions(cfg.Transversals); err != nil {
+		return nil, fmt.Errorf("validate runtime transversals: %w", err)
 	}
 	if len(cfg.Squads) == 0 {
 		return nil, fmt.Errorf("runtime requires at least one squad")
@@ -82,6 +96,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	}
 	pipeline.RouteQueryFn = cfg.RouteQueryFn
 	runtime := &Runtime{service: service, blackboard: blackboard, pipeline: pipeline}
+	runtime.registerTransversals(cfg.Transversals)
 	if err := runtime.registerSquads(cfg); err != nil {
 		_ = service.Close()
 		return nil, err
@@ -102,6 +117,40 @@ func (r *Runtime) Observability() *ObservabilityRuntime {
 // Close releases the Synapse service owned by the runtime.
 func (r *Runtime) Close() error {
 	return r.service.Close()
+}
+
+func validateTransversalDefinitions(definitions []TransversalDefinition) error {
+	registeredIDs := make(map[string]struct{}, len(definitions))
+	for _, definition := range definitions {
+		if strings.TrimSpace(definition.ID) == "" {
+			return fmt.Errorf("runtime transversal ID must not be empty")
+		}
+		if _, exists := registeredIDs[definition.ID]; exists {
+			return fmt.Errorf("runtime contains duplicate transversal ID %q", definition.ID)
+		}
+		registeredIDs[definition.ID] = struct{}{}
+		if len(definition.Capabilities) == 0 {
+			return fmt.Errorf("runtime transversal %q requires at least one capability", definition.ID)
+		}
+		for _, capability := range definition.Capabilities {
+			if strings.TrimSpace(capability) == "" {
+				return fmt.Errorf("runtime transversal %q contains an empty capability", definition.ID)
+			}
+		}
+		if definition.ExecuteTask == nil {
+			return fmt.Errorf("runtime transversal %q requires an ExecuteTask function", definition.ID)
+		}
+	}
+	return nil
+}
+
+func (r *Runtime) registerTransversals(definitions []TransversalDefinition) {
+	for _, definition := range definitions {
+		agent := NewTransversalAgent(definition.ID, definition.Type, definition.Capabilities, r.blackboard)
+		agent.Description = definition.Description
+		agent.ExecuteTask = definition.ExecuteTask
+		r.pipeline.RegisterTransversal(agent)
+	}
 }
 
 func (r *Runtime) registerSquads(cfg RuntimeConfig) error {
@@ -142,6 +191,7 @@ func (r *Runtime) registerSquads(cfg RuntimeConfig) error {
 			)
 			agent.Model = firstNonEmpty(agentDefinition.Model, squad.Model)
 			agent.LLMCall = firstLLMCall(agentDefinition.LLMCall, squad.LLMCall)
+			agent.ResumeWithLLM = agentDefinition.ResumeWithLLM
 			if agent.LLMCall == nil {
 				return fmt.Errorf("runtime agent %q requires an LLM call", agentDefinition.ID)
 			}

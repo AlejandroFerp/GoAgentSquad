@@ -227,7 +227,10 @@ func mockLLMCall(_ context.Context, _ string, systemPrompt string, messages []ma
 		if toolResult, ok := mockToolResult(messages, "verify_candidate_edges"); ok {
 			return squads.LLMResponse{Content: mockVerificationBatch(toolResult), PromptTokens: 180, CompletionTokens: 260, TotalTokens: 440}, nil
 		}
-		return squads.LLMResponse{Content: mockToolCall("verify_candidate_edges", map[string]any{}), PromptTokens: 90, CompletionTokens: 30, TotalTokens: 120}, nil
+		if containsSharedCompatibilityEvidence(messages) {
+			return squads.LLMResponse{Content: mockToolCall("verify_candidate_edges", map[string]any{}), PromptTokens: 90, CompletionTokens: 30, TotalTokens: 120}, nil
+		}
+		return squads.LLMResponse{Content: mockToolCall("delegate_transversal_get_shared_compatibility_evidence", map[string]any{"query": "all"}), PromptTokens: 90, CompletionTokens: 30, TotalTokens: 120}, nil
 	case strings.Contains(systemPrompt, "MANUAL_SYNTHESIZER"):
 		if _, ok := mockToolResult(messages, "lookup_shared_manual"); ok {
 			return squads.LLMResponse{Content: mockCompatibilityDraft(promptText(systemPrompt, messages)), PromptTokens: 260, CompletionTokens: 220, TotalTokens: 480}, nil
@@ -295,6 +298,16 @@ func mockToolResult(messages []map[string]any, toolName string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func containsSharedCompatibilityEvidence(messages []map[string]any) bool {
+	for _, message := range messages {
+		content, _ := message["content"].(string)
+		if strings.Contains(content, `"analysis_inventory"`) && strings.Contains(content, `"candidates"`) {
+			return true
+		}
+	}
+	return false
 }
 
 func mockEvidenceBatch(toolResult string) string {
